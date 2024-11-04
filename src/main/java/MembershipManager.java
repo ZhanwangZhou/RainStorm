@@ -14,12 +14,7 @@ public class MembershipManager {
     }
 
     public void addNode(Node node) {
-        if (!membership.containsKey(node.getNodeId())) {
-            membership.put(node.getNodeId(), node);
-            logger.info("Node added: " + node.getNodeId());
-        } else {
-            logger.warning("Adding failed since node already exists: " + node.getNodeId());
-        }
+        membership.put(node.getNodeId(), node);
     }
 
     public void removeNode(int nodeId) {

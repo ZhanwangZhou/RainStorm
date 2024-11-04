@@ -22,7 +22,7 @@ public class Node implements Serializable {
         this.ipAddress = ipAddress;
         this.portUDP = portUDP;
         this.portTCP = portTCP;
-        this.status = "Alive"; // Initialize to be "Alive"
+        this.status = "alive"; // Initialize to be "Alive"
     }
 
     public String getIpAddress(){

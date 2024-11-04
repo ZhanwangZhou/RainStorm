@@ -6,7 +6,7 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 public class ConsistentHashing {
-    private TreeMap<Long, String> ring;
+    private TreeMap<Long, Integer> ring;
     private MessageDigest md;
 
     public ConsistentHashing() throws NoSuchAlgorithmException {
@@ -14,26 +14,38 @@ public class ConsistentHashing {
         this.md = MessageDigest.getInstance("MD5");
     }
 
-    public void addServer(String server) {
-        long hash = generateHash(server);
+    public void addServer(int server) {
+        long hash = generateHash(String.valueOf(server));
         ring.put(hash, server);
     }
 
-    public void removeServer(String server) {
-        long hash = generateHash(server);
+    public void removeServer(int server) {
+        long hash = generateHash(String.valueOf(server));
         ring.remove(hash);
     }
 
-    public String getServer(String key) {
+    public Integer getServer(String key) {
         if (ring.isEmpty()) {
             return null;
         }
         long hash = generateHash(key);
         if (!ring.containsKey(hash)) {
-            SortedMap<Long, String> tailMap = ring.tailMap(hash);
+            SortedMap<Long, Integer> tailMap = ring.tailMap(hash);
             hash = tailMap.isEmpty() ? ring.firstKey() : tailMap.firstKey();
         }
         return ring.get(hash);
+    }
+
+    public int getSuccssor(int server) {
+        long hash = generateHash(String.valueOf(server));
+        SortedMap<Long, Integer> tailMap = ring.tailMap(hash + 1);
+        return tailMap.isEmpty() ?  ring.get(ring.firstKey()) : ring.get(tailMap.firstKey());
+    }
+
+    public int getPredecessor(int server) {
+        long hash = generateHash(String.valueOf(server));
+        SortedMap<Long, Integer> headMap = ring.headMap(hash);
+        return headMap.isEmpty() ?  ring.get(ring.lastKey()) : ring.get(headMap.lastKey());
     }
 
     private long generateHash(String key) {
@@ -48,22 +60,29 @@ public class ConsistentHashing {
 
     public static void main(String[] args) throws NoSuchAlgorithmException {
         ConsistentHashing ch = new ConsistentHashing();
-        ch.addServer("server1");
-        ch.addServer("server2");
-        ch.addServer("server3");
-        ch.addServer("server4");
-        ch.addServer("server5");
+        ch.addServer(1);
+        ch.addServer(1);
+        ch.addServer(3);
+//        ch.addServer(4);
+//        ch.addServer(5);
 
-        System.out.println(ch.ring);
-        System.out.println("key1: is present on server: " + ch.getServer("key1"));
-        System.out.println("key111: is present on server: " + ch.getServer("key111"));
-        System.out.println("key67890: is present on server: " + ch.getServer("key67890"));
+//        System.out.println("successor of 3: " + ch.getSuccssor(3));
+//        System.out.println("predecessor of 3: " + ch.getPredecessor(3));
+//        System.out.println("successor of 4: " + ch.getSuccssor(4));
+//        System.out.println("predecessor of 4: " + ch.getPredecessor(4));
+        System.out.println("successor of 1: " + ch.getSuccssor(1));
+        System.out.println("predecessor of 1: " + ch.getPredecessor(1));
 
-        ch.removeServer("server2");
-        System.out.println("After removing server2");
-
-        System.out.println("key1: is present on server: " + ch.getServer("key1"));
-        System.out.println("key111: is present on server: " + ch.getServer("key111"));
-        System.out.println("key67890: is present on server: " + ch.getServer("key67890"));
+//        System.out.println(ch.ring);
+//        System.out.println("key1: is present on server: " + ch.getServer("key1"));
+//        System.out.println("key111: is present on server: " + ch.getServer("key111"));
+//        System.out.println("key67890: is present on server: " + ch.getServer("key67890"));
+//
+//        ch.removeServer(2);
+//        System.out.println("After removing server2");
+//
+//        System.out.println("key1: is present on server: " + ch.getServer("key1"));
+//        System.out.println("key111: is present on server: " + ch.getServer("key111"));
+//        System.out.println("key67890: is present on server: " + ch.getServer("key67890"));
     }
 }

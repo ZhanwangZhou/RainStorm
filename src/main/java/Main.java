@@ -17,15 +17,6 @@ public class Main {
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1000, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(server::checkPing, 1000, 1000, TimeUnit.MILLISECONDS);
-        /*scheduler.scheduleAtFixedRate(() -> {
-            System.out.println("Ping task started");
-            server.ping();
-        }, 0, 1, TimeUnit.SECONDS);
-
-        scheduler.scheduleAtFixedRate(() -> {
-            System.out.println("CheckPing task started");
-            server.checkPing();
-        }, 0, 1, TimeUnit.SECONDS);*/
 
 
         Scanner scanner = new Scanner(System.in);
@@ -45,6 +36,20 @@ public class Main {
                     break;
                 case "list_mem":
                     server.list();
+                    break;
+                case "create":
+                    System.out.println("Enter local filepath");
+                    String localFilePath = scanner.nextLine();
+                    System.out.println("Enter HyDFS filename");
+                    String hydfsFilename = scanner.nextLine();
+                    server.createFile(localFilePath, hydfsFilename);
+                    break;
+                case "append":
+                    System.out.println("Enter local filepath");
+                    localFilePath = scanner.nextLine();
+                    System.out.println("Enter HyDFS filename");
+                    hydfsFilename = scanner.nextLine();
+                    server.appendFile(localFilePath, hydfsFilename);
                     break;
             }
         }

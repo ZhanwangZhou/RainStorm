@@ -44,6 +44,13 @@ public class Main {
                     String hydfsFilename = scanner.nextLine();
                     server.createFile(localFilePath, hydfsFilename);
                     break;
+                case "get":
+                    System.out.println("Enter HyDFS filename");
+                    hydfsFilename = scanner.nextLine();
+                    System.out.println("Enter local filepath");
+                    localFilePath = scanner.nextLine();
+                    new Thread(() -> server.getFile(hydfsFilename, localFilePath)).start();
+                    break;
                 case "append":
                     System.out.println("Enter local filepath");
                     localFilePath = scanner.nextLine();

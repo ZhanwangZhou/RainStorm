@@ -23,7 +23,9 @@ public class Main {
         while(true){
             System.out.println("Enter command for node#" + server.nodeId + ": ");
             String command = scanner.nextLine();
-            switch (command){
+            String localFilePath;
+            String hydfsFilename;
+            switch (command.split(" ")[0]){
                 case "join":
                     System.out.println("Enter introducer IP address and port:");
                     String addressAndPorts = scanner.nextLine();
@@ -35,13 +37,16 @@ public class Main {
                     server.leave();
                     break;
                 case "list_mem":
-                    server.list();
+                    server.list_mem();
+                    break;
+                case "list_self":
+                    server.list_self();
                     break;
                 case "create":
                     System.out.println("Enter local filepath");
-                    String localFilePath = scanner.nextLine();
+                    localFilePath = scanner.nextLine();
                     System.out.println("Enter HyDFS filename");
-                    String hydfsFilename = scanner.nextLine();
+                    hydfsFilename = scanner.nextLine();
                     server.createFile(localFilePath, hydfsFilename);
                     break;
                 case "get":
@@ -58,6 +63,17 @@ public class Main {
                     hydfsFilename = scanner.nextLine();
                     server.appendFile(localFilePath, hydfsFilename);
                     break;
+                case "ls":
+                    server.list_file_store(command.split(" ")[1]);
+                    break;
+                case "store":
+                    server.list_self_store();
+                    break;
+                case "list_mem_id":
+                    server.list_mem_id();
+                    break;
+                default:
+                    System.out.println("Invalid command");
             }
         }
     }

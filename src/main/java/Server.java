@@ -36,8 +36,9 @@ public class Server {
     private Boolean serverMode; // Mode Flag: false = PingAck and true = PingAck+S
 
     // File list of this server
-    Map<String, Integer> fileBlockMap;
-    LRUCache lruCache = new LRUCache(3);
+    private Set<String> localFiles;
+    private Map<String, Integer> fileBlockMap;
+    private LRUCache lruCache = new LRUCache(3);
 
     public Server(String[] args) throws IOException, NoSuchAlgorithmException {
         this.logger = Logger.getLogger("Server");
@@ -47,6 +48,7 @@ public class Server {
         this.ipAddress = args[1];
         this.portTCP = Integer.parseInt(args[2]);
         this.portUDP = Integer.parseInt(args[3]);
+        this.localFiles = new HashSet<>();
         this.fileBlockMap = new HashMap<>();
 
         this.running = true;
@@ -115,6 +117,9 @@ public class Server {
                         case "CreateFile":
                             handleCreateFile(receivedMessage);
                             break;
+                        case "RecreateFile":
+                            handleRecreateFile(receivedMessage);
+                            break;
                         case "GetFile":
                             handleGetFile(receivedMessage);
                             break;
@@ -164,7 +169,7 @@ public class Server {
     public void ping(){
         try {
             if(running) {
-                for (int nodeId : Arrays.asList(ch.getSuccssor(nodeId), ch.getPredecessor(nodeId))) {
+                for (int nodeId : Arrays.asList(ch.getSuccessor(nodeId), ch.getPredecessor(nodeId))) {
                     try (DatagramSocket socket = new DatagramSocket()) {
                         JSONObject pingMessage = new JSONObject();
                         pingMessage.put("type", "Ping");
@@ -216,12 +221,68 @@ public class Server {
         }
     }
 
-    public void list(){
-        System.out.println("Current Membership List of Node: " + nodeId);
+    public void list_mem() {
+        System.out.println("Current Membership List");
         for(int nodeId: membershipManager.getMembers().keySet()){
             System.out.println("Node ID = " + nodeId
                     + "; IP Address = " + membershipManager.getNode(nodeId).getIpAddress()
                     + "; Node Status = " + membershipManager.getNode(nodeId).getStatus());
+        }
+    }
+
+    public void list_self() {
+        System.out.println("NodeId = " + this.nodeId);
+    }
+
+    public void list_file_store(String filename) {
+        System.out.println("File " + filename + " has " + fileBlockMap.get(filename) + " blocks.");
+        for(int i = 1; i <= fileBlockMap.get(filename); ++i) {
+            list_block_store(i + "_" + filename);
+        }
+    }
+
+    public void list_block_store(String blockName) {
+        System.out.println("The block " + blockName + " is stored at following nodes:");
+        Node server1 = membershipManager.getNode(ch.getServer(blockName));
+        Node server2 = membershipManager.getNode(ch.getSuccessor(server1.getNodeId()));
+        Node server3 = membershipManager.getNode(ch.getSuccessor2(server1.getNodeId()));
+        for(Node server: Arrays.asList(server1, server2, server3)){
+            System.out.println("Node ID = " + server.getNodeId() + "; IP Address = " + server.getIpAddress()
+                    + "; Node Status = " + server.getStatus() + "; Ring ID = " + ch.getRingId(server.getNodeId()));
+        }
+    }
+
+    // 打出自己存的所有文件
+    public void list_self_store() {
+        System.out.println("Node Id = " + this.nodeId + "; Ring ID = " + ch.getRingId(this.nodeId));
+        String directoryPath = "HyDFS" + nodeId;
+        File directory = new File(directoryPath);
+
+        if (!directory.exists() || !directory.isDirectory()) {
+            System.out.println("Directory does not exist or is not a directory");
+            return;
+        }
+
+        File[] files = directory.listFiles();
+        if (files != null || files.length > 0) {
+            System.out.println("Files currently stored on server " + nodeId + ":");
+            for (File file : files) {
+                if (file.isFile()) {
+                    System.out.println(file.getName());
+                }
+            }
+        } else {
+            System.out.println("No files currently stored on server " + nodeId);
+        }
+    }
+
+    public void list_mem_id() {
+        System.out.println("Current Membership List and Ring IDs:");
+        for(int nodeId: membershipManager.getMembers().keySet()){
+            System.out.println("Node ID = " + nodeId
+                    + "; IP Address = " + membershipManager.getNode(nodeId).getIpAddress()
+                    + "; Node Status = " + membershipManager.getNode(nodeId).getStatus()
+                    + "; Ring ID = " + ch.getRingId(nodeId));
         }
     }
 
@@ -282,10 +343,13 @@ public class Server {
         fileBlockMap.put(hydfsFilename, 1);
         int receiverId = ch.getServer( "1_" + hydfsFilename);
 
+        // Add to file set
+        localFiles.add("1_" + hydfsFilename);
+
         byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
         byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
 
-        for (int memberId : Arrays.asList(receiverId, ch.getPredecessor(receiverId), ch.getSuccssor(receiverId))) {
+        for (int memberId : Arrays.asList(receiverId, ch.getSuccessor(receiverId), ch.getSuccessor2(receiverId))) {
             Node member = membershipManager.getNode(memberId);
             JSONObject createFileMessage = new JSONObject();
             createFileMessage.put("type", "CreateFile");
@@ -320,9 +384,9 @@ public class Server {
                         for(int i: receivedBlocks.get(hydfsFilename)) {
                             Node receiver = membershipManager.getNode(ch.getServer(i + "_" + hydfsFilename));
                             if(secondsPassed % 9 == 3) {
-                                receiver = membershipManager.getNode(ch.getPredecessor(receiver.getNodeId()));
+                                receiver = membershipManager.getNode(ch.getSuccessor(receiver.getNodeId()));
                             } else if(secondsPassed % 9 == 6) {
-                                receiver = membershipManager.getNode(ch.getSuccssor(receiver.getNodeId()));
+                                receiver = membershipManager.getNode(ch.getSuccessor2(receiver.getNodeId()));
                             }
                             JSONObject getFileMessage = new JSONObject();
                             getFileMessage.put("type", "GetFile");
@@ -458,15 +522,19 @@ public class Server {
                 fileBlockMap.put(hydfsFilename, newBlockNum);
                 logger.info("Appended block " + newBlockNum + " to file " + hydfsFilename + " and saved to " + filePath);
 
+                // Add to localFiles set
+                localFiles.add(newBlockNum + "_" + hydfsFilename);
+
+                // Create the file in current Node's successor and successor2
                 JSONObject createFileMessage = new JSONObject();
                 createFileMessage.put("type", "CreateFile");
                 createFileMessage.put("hydfsFileName", hydfsFilename);
                 createFileMessage.put("blockNum", newBlockNum);
                 createFileMessage.put("blockData", Base64.getEncoder().encodeToString(data));
-                Node predecessor = membershipManager.getNode(ch.getPredecessor(nodeId));
-                Node successor = membershipManager.getNode(ch.getSuccssor(nodeId));
-                sendTCP(predecessor.getIpAddress(), predecessor.getPortTCP(), createFileMessage);
+                Node successor = membershipManager.getNode(ch.getSuccessor(nodeId));
+                Node successor2 = membershipManager.getNode(ch.getSuccessor2(nodeId));
                 sendTCP(successor.getIpAddress(), successor.getPortTCP(), createFileMessage);
+                sendTCP(successor2.getIpAddress(), successor2.getPortTCP(), createFileMessage);
 
                 // Notify other member with new blockCount
                 JSONObject updateFileMessage = new JSONObject();
@@ -482,7 +550,7 @@ public class Server {
 
     }
 
-    public void handleCreateFile(JSONObject message) {
+    private void handleCreateFile(JSONObject message) {
         try {
             String hydfsFilename = message.getString("hydfsFileName");
             int blockNum = message.getInt("blockNum");
@@ -492,6 +560,9 @@ public class Server {
             String filePath = "HyDFS" + nodeId + "/" + blockNum + "_" + hydfsFilename ;
             Files.write(Paths.get(filePath), data);
 
+            // Add to the localFiles set
+            localFiles.add(blockNum + "_" + hydfsFilename);
+
             fileBlockMap.put(hydfsFilename, blockNum); // Initially, each file starts with one block
             logger.info("Block " + blockNum + " of file " + hydfsFilename + " saved to " + filePath);
         } catch (IOException e) {
@@ -499,7 +570,7 @@ public class Server {
         }
     }
 
-    public void handleUpdateFile(JSONObject message) {
+    private void handleUpdateFile(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFileName");
         int blockNum = message.getInt("blockNum");
         fileBlockMap.put(hydfsFilename, blockNum);
@@ -512,7 +583,7 @@ public class Server {
             predecessorLastPingTime = clock.millis();
             predecessorlastPingId = message.getInt("nodeId");
         }
-        if (message.getInt("nodeId") == ch.getSuccssor(nodeId)) {
+        if (message.getInt("nodeId") == ch.getSuccessor(nodeId)) {
             successorLastPingTime = clock.millis();
             successorlastPingId = message.getInt("nodeId");
         }
@@ -583,35 +654,122 @@ public class Server {
 
 
     // MemberList 里面的node收到leave message 之后来handleLeave
-    private void handleLeave(JSONObject message) {
-        int leaveNodeId = message.getInt("nodeId");
-        Node leavingNode = membershipManager.getNode(leaveNodeId);
+    private void handleLeave(JSONObject message) throws IOException {
+        int leftNodeId = message.getInt("nodeId");
+        Node leavingNode = membershipManager.getNode(leftNodeId);
 
-        // Check if the node exist
-        if (leavingNode != null) {
-            // Set leavingNode status to 'leave'
-            leavingNode.setStatus("leave");
-            logger.info("Node" + leaveNodeId + " left successfully, set status to \"leave\"");
-            // Update consistent hashing ring
-            ch.removeServer(leaveNodeId);
-            gossipTCP(message);
-        } else {
-            logger.warning("Node" + leaveNodeId + " not found");
+        if(ch.getRingId(leftNodeId) != -1) {
+            // Loop through local files to create message for all files to be re-replicated
+            List<JSONObject> recreateFileMessages = new ArrayList<>();
+            Set<String> localFilesCopy = new HashSet<>(localFiles);
+            for (String localFile : localFilesCopy) {
+                Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
+                System.out.println(localFilePath.toString());
+                int server1Id = ch.getServer(localFile);
+                int server2Id = ch.getSuccessor(server1Id);
+                int server3Id = ch.getSuccessor2(server1Id);
+                if (server1Id == leftNodeId || server2Id == leftNodeId || server3Id == leftNodeId) {
+                    byte[] fileContent = Files.readAllBytes(localFilePath);
+                    byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
+                    JSONObject recreateFileMessage = new JSONObject();
+                    recreateFileMessage.put("type", "RecreateFile");
+                    recreateFileMessage.put("blockName", localFile);
+                    recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
+                    recreateFileMessages.add(recreateFileMessage);
+                    Files.deleteIfExists(localFilePath);
+                    localFiles.remove(localFile);
+                }
+            }
+            // Check if the node exist
+            if (leavingNode != null) {
+                // Set leavingNode status to 'leave'
+                leavingNode.setStatus("leave");
+                logger.info("Node" + leftNodeId + " left successfully, set status to \"leave\"");
+                // Update consistent hashing ring
+                ch.removeServer(leftNodeId);
+                gossipTCP(message);
+            } else {
+                logger.warning("Node" + leftNodeId + " not found");
+                return;
+            }
+            // Send re-create messages and file data to the new server to store the file
+            for(JSONObject recreateFileMessage : recreateFileMessages){
+                Node receiver1 = membershipManager.getNode(
+                        ch.getServer(recreateFileMessage.getString("blockName"))
+                );
+                Node receiver2 = membershipManager.getNode(ch.getSuccessor(receiver1.getNodeId()));
+                Node receiver3 = membershipManager.getNode(ch.getSuccessor(receiver2.getNodeId()));
+                for (Node member : Arrays.asList(receiver1, receiver2, receiver3)) {
+                    sendTCP(member.getIpAddress(), member.getPortTCP(), recreateFileMessage);
+                }
+            }
         }
     }
 
-    private void handleFailure(JSONObject message) {
-        int failedNodeId = message.getInt("nodeId");
-        // 在consistent hashing ring 和 membership manager当中删除掉这个节点
-        ch.removeServer(failedNodeId);
-        membershipManager.removeNode(failedNodeId);
-        logger.info("Node " + failedNodeId + " marked as failed node and removed from membership list and ring");
 
-        // 如果被判断的是当前节点直接改running为 false
-        if (this.nodeId == failedNodeId) {
-            this.running = false;
+    private void handleFailure(JSONObject message) throws IOException {
+        int failedNodeId = message.getInt("nodeId");
+
+        if(ch.getRingId(failedNodeId) != -1){
+            // Loop through local files to create message for all files to be re-replicated
+            List<JSONObject> recreateFileMessages = new ArrayList<>();
+            Set<String> localFilesCopy = new HashSet<>(localFiles);
+            for (String localFile : localFilesCopy) {
+                Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
+                System.out.println(localFilePath.toString());
+                int server1Id = ch.getServer(localFile);
+                int server2Id = ch.getSuccessor(server1Id);
+                int server3Id = ch.getSuccessor2(server1Id);
+                if (server1Id == failedNodeId || server2Id == failedNodeId || server3Id == failedNodeId) {
+                    byte[] fileContent = Files.readAllBytes(localFilePath);
+                    byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
+                    JSONObject recreateFileMessage = new JSONObject();
+                    recreateFileMessage.put("type", "RecreateFile");
+                    recreateFileMessage.put("blockName", localFile);
+                    recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
+                    recreateFileMessages.add(recreateFileMessage);
+                    Files.deleteIfExists(localFilePath);
+                    localFiles.remove(localFile);
+                }
+            }
+            // 在consistent hashing ring 和 membership manager当中删除掉这个节点
+            ch.removeServer(failedNodeId);
+            membershipManager.removeNode(failedNodeId);
+            logger.info("Node " + failedNodeId + " marked as failed node and removed from membership list and ring");
+            // 如果被判断的是当前节点直接改running为 false
+            if (this.nodeId == failedNodeId) {
+                this.running = false;
+            }
+            gossipTCP(message);
+            // Send re-create messages and file data to the new server to store the file
+            for(JSONObject recreateFileMessage : recreateFileMessages){
+                Node receiver1 = membershipManager.getNode(
+                        ch.getServer(recreateFileMessage.getString("blockName"))
+                );
+                Node receiver2 = membershipManager.getNode(ch.getSuccessor(receiver1.getNodeId()));
+                Node receiver3 = membershipManager.getNode(ch.getSuccessor(receiver2.getNodeId()));
+                for (Node member : Arrays.asList(receiver1, receiver2, receiver3)) {
+                    sendTCP(member.getIpAddress(), member.getPortTCP(), recreateFileMessage);
+                }
+            }
         }
-        gossipTCP(message);
+    }
+
+    public void handleRecreateFile(JSONObject message) {
+        try {
+            String blockName = message.getString("blockName");
+            byte[] blockData = Base64.getDecoder().decode(message.getString("blockData"));
+
+            String filePath = "HyDFS" + nodeId + "/" + blockName;
+            Path path = Paths.get(filePath);
+            Files.write(path, blockData);
+            // Add to localFiles
+            localFiles.add(blockName);
+            logger.info("Recreated block " + blockName + " and saved to local storage at " + filePath);
+        } catch (IOException e) {
+            logger.warning("Failed to recreate block " + message.getString("blockName") + ": " + e.getMessage());
+        }
+
     }
 
     private void handleMembershipList(JSONObject message) {

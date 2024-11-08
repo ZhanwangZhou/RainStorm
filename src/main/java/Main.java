@@ -12,20 +12,21 @@ import java.util.concurrent.*;
 public class Main {
     public static void main(String[] args) throws IOException, NoSuchAlgorithmException, InterruptedException {
         Server server = new Server(args);
-        new Thread(server::tcpListen).start();
-        new Thread(server::udpListen).start();
+        Thread tcpListen = new Thread(server::tcpListen);
+        tcpListen.start();
+        Thread udpListen = new Thread(server::udpListen);
+        udpListen.start();
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1000, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(server::checkPing, 1000, 1000, TimeUnit.MILLISECONDS);
 
 
         Scanner scanner = new Scanner(System.in);
-        while(true){
+        boolean running = true;
+        while(running){
             System.out.println("Enter command for node#" + server.nodeId + ": ");
-            String command = scanner.nextLine();
-            String localFilePath;
-            String hydfsFilename;
-            switch (command.split(" ")[0]){
+            String[] command = scanner.nextLine().split(" ");
+            switch (command[0]){
                 case "join":
                     System.out.println("Enter introducer IP address and port:");
                     String addressAndPorts = scanner.nextLine();
@@ -43,34 +44,65 @@ public class Main {
                     server.list_self();
                     break;
                 case "create":
-                    System.out.println("Enter local filepath");
-                    localFilePath = scanner.nextLine();
-                    System.out.println("Enter HyDFS filename");
-                    hydfsFilename = scanner.nextLine();
-                    server.createFile(localFilePath, hydfsFilename);
+                    if (command.length == 3) {
+                        server.createFile(command[1], command[2]);
+                    } else {
+                        System.out.println("Please specify the command as: create <Local Filepath> <HyDFS Filename>");
+                    }
                     break;
                 case "get":
-                    System.out.println("Enter HyDFS filename");
-                    hydfsFilename = scanner.nextLine();
-                    System.out.println("Enter local filepath");
-                    localFilePath = scanner.nextLine();
-                    new Thread(() -> server.getFile(hydfsFilename, localFilePath)).start();
+                    if (command.length == 3) {
+                        new Thread(() -> server.getFile(command[1], command[2])).start();
+                    } else {
+                        System.out.println("Please specify the command as: get <HyDFS Filename> <Local Filepath>");
+                    }
+                    break;
+                case "getfromreplica":
+                    if (command.length == 4) {
+                        server.getFromReplica(command[1], command[2], command[3]);
+                    } else {
+                        System.out.println("Please specify command as: getfromreplica <VM Address>"
+                                + " <HyDFS Filename> <Local Filepath>");
+                    }
                     break;
                 case "append":
-                    System.out.println("Enter local filepath");
-                    localFilePath = scanner.nextLine();
-                    System.out.println("Enter HyDFS filename");
-                    hydfsFilename = scanner.nextLine();
-                    server.appendFile(localFilePath, hydfsFilename);
+                    if (command.length == 3) {
+                        server.appendFile(command[1], command[2]);
+                    } else {
+                        System.out.println("Please specify the command as: append <Local Filepath> <HyDFS Filename>");
+                    }
+                    break;
+                case "multiappend":
+                    System.out.println("Enter HyDFS filename (<hydfsFilename>):");
+                    String hydfsFilename = scanner.nextLine();
+                    System.out.println("Enter list of nodef IDs to append (<nodeId1>,<nodeId2>,...,<nodeId3>)");
+                    String nodeIds = scanner.nextLine();
+                    System.out.println("Enter list of local filepath (<localFilePath1>,<localFilePath2>,...,<localFilePath3>)");
+                    String localFilenames = scanner.nextLine();
+                    server.appendMultiFiles(hydfsFilename, nodeIds, localFilenames);
+                    break;
+                case "merge":
+                    if (command.length == 2) {
+                        server.mergeFile(command[1]);
+                    } else {
+                        System.out.print("Please specify the command as: merge <HyDFS Filename>");
+                    }
                     break;
                 case "ls":
-                    server.list_file_store(command.split(" ")[1]);
+                    if (command.length == 2) {
+                        server.list_file_store(command[1]);
+                    } else {
+                        System.out.println("Please specify the command as: ls <HyDFS Filename>");
+                    }
                     break;
                 case "store":
                     server.list_self_store();
                     break;
                 case "list_mem_id":
                     server.list_mem_id();
+                    break;
+                case "quit":
+                    running = false;
                     break;
                 default:
                     System.out.println("Invalid command");

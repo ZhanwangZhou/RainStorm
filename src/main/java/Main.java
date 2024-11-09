@@ -43,6 +43,15 @@ public class Main {
                 case "list_self":
                     server.list_self();
                     break;
+                case "enable_sus":
+                    server.switchMode(true);
+                    break;
+                case "disable_sus":
+                    server.switchMode(false);
+                    break;
+                case "status_sus":
+                    server.statusSus();
+                    break;
                 case "create":
                     if (command.length == 3) {
                         server.createFile(command[1], command[2]);

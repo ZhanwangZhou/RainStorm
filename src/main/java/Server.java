@@ -13,6 +13,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.*;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class Server {
@@ -31,6 +32,8 @@ public class Server {
     private int predecessorLastPingId;
     private long successorLastPingTime;
     private int successorLastPingId;
+    private Map<Integer, Long> lastPingTimes;
+    private Map<Integer, Integer> incarnationNumbers;
     private Map<String, Set<Integer>> unreceivedBlocks;
     private Boolean running;
     private Boolean serverMode; // Mode Flag: false = PingAck and true = PingAck+S
@@ -59,7 +62,12 @@ public class Server {
         this.membershipManager = new MembershipManager();
         membershipManager.addNode(new Node(nodeId, ipAddress, portUDP, portTCP, "alive"));
         ch.addServer(nodeId);
+        this.lastPingTimes = new HashMap<>();
+        this.incarnationNumbers = new HashMap<>();
+        incarnationNumbers.put(nodeId, 0);
         this.unreceivedBlocks = new HashMap<>();
+
+        logger.setLevel(Level.OFF);
 
         File directory = new File("HyDFS" + nodeId);
         if(!directory.exists()) {
@@ -156,6 +164,9 @@ public class Server {
                         case "UpdateFile":
                             handleUpdateFile(receivedMessage);
                             break;
+                        case "SuspicionModeUpdate":
+                            handleModeUpdate(receivedMessage);
+                            break;
                     }
                 }
 
@@ -178,10 +189,19 @@ public class Server {
                 ObjectInputStream ois = new ObjectInputStream(bais);
                 // if(!running) break;
                 JSONObject receivedMessage = new JSONObject((String) ois.readObject()) ;
-
+                // System.out.println(receivedMessage);
                 switch(receivedMessage.getString("type")) {
                     case "Ping":
                         handlePing(receivedMessage);
+                        break;
+                    case "PingAck":
+                        handlePingAck(receivedMessage);
+                        break;
+                    case "Suspect":
+                        handleSuspicion(receivedMessage);
+                        break;
+                    case "Alive":
+                        handleAlive(receivedMessage);
                         break;
                 }
             }
@@ -190,30 +210,77 @@ public class Server {
         }
     }
 
+    public void switchMode(boolean suspicionMode) {
+        this.serverMode = suspicionMode;
+        if (suspicionMode) {
+            System.out.println("Suspicion mode enabled");
+        } else {
+            System.out.println("Suspicion mode disabled");
+        }
+
+        // Gossip to all nodes
+        JSONObject suspicionMessage = new JSONObject();
+        suspicionMessage.put("type", "SuspicionModeUpdate");
+        suspicionMessage.put("suspicionMode", suspicionMode ? "enabled" : "disabled");
+        suspicionMessage.put("gossipCount", 0);
+
+        gossip(suspicionMessage, true);
+    }
+
+    private void handleModeUpdate(JSONObject message) {
+        boolean suspicionMode = message.getString("suspicionMode").equals("enabled");
+        this.serverMode = suspicionMode;
+        lastPingTimes.clear();
+        if (suspicionMode) {
+            System.out.println("Suspicion mode enabled");
+        } else {
+            System.out.println("Suspicion mode disabled");
+        }
+        gossip(message, true);
+    }
+
+    public void statusSus() {
+        System.out.println(serverMode ? "Suspicion mode enabled" : "Suspicion mode disabled");
+    }
+
     public void ping(){
         try {
-            if(running) {
-                for (int nodeId : Arrays.asList(ch.getSuccessor(nodeId), ch.getPredecessor(nodeId))) {
-                    try (DatagramSocket socket = new DatagramSocket()) {
-                        JSONObject pingMessage = new JSONObject();
-                        pingMessage.put("type", "Ping");
-                        pingMessage.put("nodeId", this.nodeId);
-                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                        ObjectOutputStream oos = new ObjectOutputStream(baos);
-                        oos.writeObject(pingMessage.toString());
-                        byte[] buffer = baos.toByteArray();
-                        InetAddress address = InetAddress.getByName(membershipManager.getNode(nodeId).getIpAddress());
-                        int port = membershipManager.getNode(nodeId).getPortUDP();
-                        DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, port);
-                        socket.send(packet);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+            if (running) {
+                JSONObject pingMessage = new JSONObject();
+                pingMessage.put("type", "Ping");
+                pingMessage.put("nodeId", this.nodeId);
+                if (serverMode) {
+                    List<Integer> availableMembers = new ArrayList<>();
+                    for(int nodeId : membershipManager.getMembers().keySet()){
+                        if (membershipManager.getNode(nodeId).getStatus().equals("alive")
+                                || membershipManager.getNode(nodeId).getStatus().equals("suspect")) {
+                            availableMembers.add(nodeId);
+                        }
+                    }
+                    Node receiver = membershipManager.getNode(availableMembers.get(
+                            (int)(Math.random() * availableMembers.size())
+                    ));
+                    lastPingTimes.put(receiver.getNodeId(), clock.millis());
+                    sendUDP(receiver.getIpAddress(), receiver.getPortUDP(), pingMessage);
+                }else {
+                    for (int nodeId : Arrays.asList(ch.getSuccessor(nodeId), ch.getPredecessor(nodeId))) {
+                        try (DatagramSocket socket = new DatagramSocket()) {
+                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                            ObjectOutputStream oos = new ObjectOutputStream(baos);
+                            oos.writeObject(pingMessage.toString());
+                            byte[] buffer = baos.toByteArray();
+                            InetAddress address = InetAddress.getByName(membershipManager.getNode(nodeId).getIpAddress());
+                            int port = membershipManager.getNode(nodeId).getPortUDP();
+                            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, port);
+                            socket.send(packet);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
                     }
                 }
             }
         } catch (Exception e) {
-            logger.warning("Exception in ping");
-            e.printStackTrace();
+            logger.warning("Exception in ping" + e.getMessage());
         }
 
     }
@@ -222,26 +289,53 @@ public class Server {
         try {
             if(running) {
                 long currentTime = clock.millis();
-                if(currentTime - predecessorLastPingTime > 5000) {
-                    System.out.println(currentTime + " " + predecessorLastPingTime);
-                    JSONObject failureMessage = new JSONObject();
-                    failureMessage.put("type", "Failure");
-                    failureMessage.put("nodeId", this.predecessorLastPingId);
-                    failureMessage.put("gossipCount", 0);
-                    gossipTCP(failureMessage);
-                }
-                if(currentTime - successorLastPingTime > 5000) {
-                    System.out.println(currentTime + " " + successorLastPingTime);
-                    JSONObject failureMessage = new JSONObject();
-                    failureMessage.put("type", "Failure");
-                    failureMessage.put("nodeId", this.successorLastPingId);
-                    failureMessage.put("gossipCount", 0);
-                    gossipTCP(failureMessage);
+                if (!serverMode) {
+                    if(currentTime - predecessorLastPingTime > 5000) {
+                        System.out.println(currentTime + " " + predecessorLastPingTime);
+                        JSONObject failureMessage = new JSONObject();
+                        failureMessage.put("type", "Failure");
+                        failureMessage.put("nodeId", this.predecessorLastPingId);
+                        failureMessage.put("gossipCount", 0);
+                        gossip(failureMessage, true);
+                    }
+                    if(currentTime - successorLastPingTime > 5000) {
+                        System.out.println(currentTime + " " + successorLastPingTime);
+                        JSONObject failureMessage = new JSONObject();
+                        failureMessage.put("type", "Failure");
+                        failureMessage.put("nodeId", this.successorLastPingId);
+                        failureMessage.put("gossipCount", 0);
+                        gossip(failureMessage, true);
+                    }
+                } else {
+                    currentTime = clock.millis();
+                    for (Map.Entry<Integer, Long> entry : lastPingTimes.entrySet()) {
+                        int nodeId = entry.getKey();
+                        Node member = membershipManager.getNode(nodeId);
+                        System.out.println(member == null ? "member is null" : "member id: " + member.getNodeId());
+                        long lastPingTime = entry.getValue();
+
+                        System.out.println("Node ID: " + nodeId + "Last Ping Time: " + lastPingTime);
+
+                        if (currentTime - lastPingTime > 3000 && member.getStatus().equals("alive")) {
+                            JSONObject suspicionMessage = new JSONObject();
+                            suspicionMessage.put("type", "Suspect");
+                            suspicionMessage.put("nodeId", nodeId);
+                            suspicionMessage.put("gossipCount", 0);
+                            suspicionMessage.put("incarnation", incarnationNumbers.get(nodeId));
+                            gossip(suspicionMessage, false);
+                            lastPingTimes.put(nodeId, currentTime);
+                        } else if (currentTime - lastPingTime > 5000 && member.getStatus().equals("suspect")) {
+                            JSONObject failureMessage = new JSONObject();
+                            failureMessage.put("type", "Failure");
+                            failureMessage.put("nodeId", nodeId);
+                            failureMessage.put("gossipCount", 0);
+                            gossip(failureMessage, true);
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
-            logger.warning("Exception in checkPing");
-            e.printStackTrace();
+            logger.warning("Exception in checkPing" + e.getMessage());
         }
     }
 
@@ -303,7 +397,6 @@ public class Server {
     public void join(String introIpAddress, int introPort) throws IOException, InterruptedException {
         running = true;
         membershipManager.clear();
-        // pingedList.clear();
         membershipManager.addNode(new Node(nodeId, ipAddress, portUDP, portTCP, "alive"));
         JSONObject joinMessage = new JSONObject();
         joinMessage.put("type", "Join");
@@ -332,7 +425,7 @@ public class Server {
         leaveMessage.put("type", "Leave");
         leaveMessage.put("nodeId", nodeId);
         leaveMessage.put("gossipCount", 0);
-        gossipTCP(leaveMessage);
+        gossip(leaveMessage, true);
     }
 
 //    JSONObject createFileMessage = new JSONObject();
@@ -376,7 +469,7 @@ public class Server {
         updateFileMessage.put("hydfsFilename", hydfsFilename);
         updateFileMessage.put("blockNum", 1);
         updateFileMessage.put("gossipCount", 0);
-        gossipTCP(updateFileMessage);
+        gossip(updateFileMessage, true);
 
     }
 
@@ -421,11 +514,7 @@ public class Server {
                 try (BufferedWriter writer = new BufferedWriter(new FileWriter("Cache" + nodeId + "/" + hydfsFilename))) {
                     for(String blockFile: blockFiles){
                         Path blockFilePath = Paths.get(blockFile);
-                        for(String line : Files.readAllLines(blockFilePath)){
-                            System.out.println(line);
-                            writer.write(line);
-                            writer.newLine();
-                        }
+                        writer.write(Files.readString(blockFilePath));
                         Files.deleteIfExists(blockFilePath);
                     }
                 }
@@ -463,8 +552,6 @@ public class Server {
     public void appendMultiFiles(String hydfsFilename, String nodeIds, String localFilenames) throws IOException {
         String[] nodeIdArray = nodeIds.replaceAll("\\s", "").split(",");
         String[] localFilenameArray = localFilenames.replaceAll("\\s", "").split(",");
-        System.out.println("--------------------------------");
-        System.out.println(nodeIdArray.length);
         if (nodeIdArray.length != localFilenameArray.length) {
             System.out.println("Please specify equal number of node IDs and local filepath");
             return;
@@ -481,8 +568,6 @@ public class Server {
                 System.out.println("Please specify node IDs as integers");
                 return;
             }
-            System.out.println("---------------*-----------------");
-            System.out.println(receiver.getNodeId());
             sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), appendFileRequestMessage);
         }
     }
@@ -494,7 +579,7 @@ public class Server {
         mergeRequest.put("requesterNodeId", this.nodeId);
         mergeRequest.put("gossipCount", 0);
 
-        gossipTCP(mergeRequest);
+        gossip(mergeRequest, true);
         logger.info("Broadcasted merge request for " + hyDFSfilename + " to all nodes.");
     }
 
@@ -667,7 +752,7 @@ public class Server {
                 updateFileMessage.put("hydfsFilename", hydfsFilename);
                 updateFileMessage.put("blockNum", newBlockNum);
                 updateFileMessage.put("gossipCount", 0);
-                gossipTCP(updateFileMessage);
+                gossip(updateFileMessage, true);
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -705,20 +790,106 @@ public class Server {
         String hydfsFilename = message.getString("hydfsFilename");
         int blockNum = message.getInt("blockNum");
         fileBlockMap.put(hydfsFilename, blockNum);
-        gossipTCP(message);
+        gossip(message, true);
     }
 
 
     private void handlePing(JSONObject message) {
-        if (message.getInt("nodeId") == ch.getPredecessor(nodeId)) {
-            predecessorLastPingTime = clock.millis();
-            predecessorLastPingId = message.getInt("nodeId");
-        }
-        if (message.getInt("nodeId") == ch.getSuccessor(nodeId)) {
-            successorLastPingTime = clock.millis();
-            successorLastPingId = message.getInt("nodeId");
+        if (serverMode){
+            JSONObject pingAckMessage = new JSONObject();
+            pingAckMessage.put("type", "PingAck");
+            pingAckMessage.put("nodeId", nodeId);
+            pingAckMessage.put("incarnation", incarnationNumbers.get(nodeId));
+            Node receiver = membershipManager.getNode(message.getInt("nodeId"));
+            sendUDP(receiver.getIpAddress(), receiver.getPortUDP(), pingAckMessage);
+        } else {
+            if (message.getInt("nodeId") == ch.getPredecessor(nodeId)) {
+                predecessorLastPingTime = clock.millis();
+                predecessorLastPingId = message.getInt("nodeId");
+            }
+            if (message.getInt("nodeId") == ch.getSuccessor(nodeId)) {
+                successorLastPingTime = clock.millis();
+                successorLastPingId = message.getInt("nodeId");
+            }
         }
     }
+
+
+    private void handlePingAck(JSONObject message) {
+        try {
+            int senderNodeId = message.getInt("nodeId");
+            int receivedIncarnation = message.getInt("incarnation");
+            long currentTime = clock.millis();
+            lastPingTimes.remove(senderNodeId);
+            System.out.println("Current lastPingTimes after ack removal node#: " + senderNodeId + " "+ lastPingTimes);
+            logger.info("Received PingAck from node: " + senderNodeId);
+
+            if (serverMode) {
+                Node senderNode = membershipManager.getNode(senderNodeId);
+                if (senderNode != null && senderNode.getStatus().equals("suspect")) {
+                    // Update incarnation number
+                    int currentIncarnation = incarnationNumbers.getOrDefault(senderNodeId, 0);
+                    if (receivedIncarnation > currentIncarnation) {
+                        incarnationNumbers.put(senderNodeId, receivedIncarnation);
+                        senderNode.setStatus("alive");
+                        logger.info("Node " + senderNodeId + "status set to alive after received ping from it");
+
+                        // Gossip the status change
+                        JSONObject statusUpdateMessage = new JSONObject();
+                        statusUpdateMessage.put("type", "Alive");
+                        statusUpdateMessage.put("nodeId", senderNodeId);
+                        statusUpdateMessage.put("incarnation", receivedIncarnation);
+
+                        gossip(statusUpdateMessage, false);
+                    }
+                }
+            }
+        } catch (JSONException e) {
+            logger.warning("Error parsing PingAck message: " + e.getMessage());
+        }
+    }
+
+    // 处理被误判的node
+    private void handleAlive(JSONObject message) {
+        try {
+            int aliveNodeId = message.getInt("nodeId");
+            int receivedIncarnation = message.getInt("incarnation");
+
+            int currentIncarnation = incarnationNumbers.getOrDefault(aliveNodeId, 0);
+            if (receivedIncarnation > currentIncarnation) {
+                membershipManager.getNode(aliveNodeId).setStatus("alive");
+                incarnationNumbers.put(aliveNodeId, receivedIncarnation);
+                lastPingTimes.remove(aliveNodeId);
+                logger.info("Node " + aliveNodeId + "status set to alive");
+                gossip(message, false);
+            }
+        } catch (JSONException e) {
+            logger.warning("Error parsing StatusUpdate message: " + e.getMessage());
+        }
+    }
+
+    private void handleSuspicion(JSONObject message) {
+        int suspectNodeId = message.getInt("nodeId");
+        int incarnationNumber = message.getInt("incarnation");
+        if (suspectNodeId == nodeId) {
+            if (incarnationNumber > incarnationNumbers.get(nodeId)) {
+                incarnationNumbers.put(nodeId, incarnationNumber + 1);
+                JSONObject aliveMessage = new JSONObject();
+                aliveMessage.put("type", "Alive");
+                aliveMessage.put("nodeId", nodeId);
+                aliveMessage.put("incarnation", incarnationNumbers.get(nodeId));
+                gossip(aliveMessage, false);
+            }
+        } else {
+            membershipManager.getNode(suspectNodeId).setStatus("suspect");
+            if (incarnationNumber > incarnationNumbers.get(suspectNodeId)){
+                incarnationNumbers.put(suspectNodeId, incarnationNumber);
+            }
+            gossip(message, false);
+        }
+    }
+
+
 
     // Introducer handle join request
     private void handleJoinRequest(JSONObject message) {
@@ -731,6 +902,9 @@ public class Server {
 
         membershipManager.addNode(joiningNode);
         ch.addServer(joiningNodeId);
+        if (!incarnationNumbers.containsKey(joiningNodeId)) {
+            incarnationNumbers.put(joiningNodeId, 0);
+        }
         logger.info("Node " + joiningNode.getNodeId() + " joined successfully");
 
         // 创建Join-Update消息
@@ -780,6 +954,9 @@ public class Server {
 
         membershipManager.addNode(joiningNode);
         ch.addServer(joiningNodeId);
+        if (!incarnationNumbers.containsKey(joiningNodeId)) {
+            incarnationNumbers.put(joiningNodeId, 0);
+        }
         logger.info("Node " + joiningNode.getNodeId() + " joined successfully");
     }
 
@@ -795,7 +972,7 @@ public class Server {
             Set<String> localFilesCopy = new HashSet<>(localFiles);
             for (String localFile : localFilesCopy) {
                 Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
-                System.out.println(localFilePath.toString());
+                System.out.println(localFilePath);
                 int server1Id = ch.getServer(localFile);
                 int server2Id = ch.getSuccessor(server1Id);
                 int server3Id = ch.getSuccessor2(server1Id);
@@ -818,7 +995,7 @@ public class Server {
                 logger.info("Node" + leftNodeId + " left successfully, set status to \"leave\"");
                 // Update consistent hashing ring
                 ch.removeServer(leftNodeId);
-                gossipTCP(message);
+                gossip(message, true);
             } else {
                 logger.warning("Node" + leftNodeId + " not found");
                 return;
@@ -866,12 +1043,14 @@ public class Server {
             // 在consistent hashing ring 和 membership manager当中删除掉这个节点
             ch.removeServer(failedNodeId);
             membershipManager.removeNode(failedNodeId);
+            incarnationNumbers.remove(failedNodeId);
+            lastPingTimes.remove(failedNodeId);
             logger.info("Node " + failedNodeId + " marked as failed node and removed from membership list and ring");
             // 如果被判断的是当前节点直接改running为 false
             if (this.nodeId == failedNodeId) {
                 this.running = false;
             }
-            gossipTCP(message);
+            gossip(message, true);
             // Send re-create messages and file data to the new server to store the file
             for(JSONObject recreateFileMessage : recreateFileMessages){
                 Node receiver1 = membershipManager.getNode(
@@ -922,6 +1101,9 @@ public class Server {
             Node memberNode = new Node(memberId, memberIp, memberPortUDP, memberPortTCP, memberStatus);
             membershipManager.addNode(memberNode);
             ch.addServer(memberId);
+            if (!incarnationNumbers.containsKey(memberId)) {
+                incarnationNumbers.put(memberId, 0);
+            }
         }
 
         logger.info("Update membership List completed from introducer");
@@ -984,7 +1166,7 @@ public class Server {
             mergeAckMessage.put("requesterNodeId", requesterNodeId);
             mergeAckMessage.put("hydfsFilename", hydfsFilename);
             mergeAckMessage.put("gossipCount", 0);
-            gossipTCP(mergeAckMessage);
+            gossip(mergeAckMessage, true);
         // If the current not does not store block 1 for hydfsFilename
         }else{
             try{
@@ -1079,7 +1261,7 @@ public class Server {
         }
     }
 
-    private void gossipTCP(JSONObject message) {
+    private void gossip(JSONObject message, boolean isTCP) {
         int gossipCount = message.getInt("gossipCount");
         if(gossipCount > 2){
             return;
@@ -1099,8 +1281,31 @@ public class Server {
             return;
         }
 
-        for(Node member: availableMembers) {
-            sendTCP(member.getIpAddress(), member.getPortTCP(), message);
+        Collections.shuffle(availableMembers, new Random());
+        List<Node> selectedMembers = availableMembers.subList(0, availableNumber);
+
+        for(Node member: selectedMembers) {
+            if (isTCP) {
+                sendTCP(member.getIpAddress(), member.getPortTCP(), message);
+            } else {
+                sendUDP(member.getIpAddress(), member.getPortUDP(), message);
+            }
+
+        }
+    }
+
+    private void sendUDP(String receiverIp, int receiverPort, JSONObject message) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(baos);
+            oos.writeObject(message.toString());
+            byte[] buffer = baos.toByteArray();
+            InetAddress address = InetAddress.getByName(receiverIp);
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, receiverPort);
+            socket.send(packet);
+        } catch (IOException e) {
+            logger.warning("Failed to send " + message.getString("type") + " message to " + receiverIp + ":" +
+                    receiverPort);
         }
     }
 

@@ -2,6 +2,7 @@ package main.java;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class MembershipManager {
@@ -11,6 +12,8 @@ public class MembershipManager {
     public MembershipManager() {
         this.membership = new HashMap<>();
         this.logger = Logger.getLogger("MembershipManager");
+
+        logger.setLevel(Level.OFF);
     }
 
     public void addNode(Node node) {

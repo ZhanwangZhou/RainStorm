@@ -6,10 +6,8 @@ import java.net.ServerSocket;
 import java.net.*;
 import org.json.*;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.*;
@@ -21,27 +19,32 @@ public class Server {
     final String ipAddress;
     final int portTCP;
     final int portUDP;
+
     final Logger logger;
     final Clock clock;
 
     private ServerSocket tcpServerSocket;
     private ConsistentHashing ch;
 
-    private MembershipManager membershipManager;
+    final MembershipManager membershipManager;
     private long predecessorLastPingTime;
     private int predecessorLastPingId;
     private long successorLastPingTime;
     private int successorLastPingId;
-    private Map<Integer, Long> lastPingTimes;
-    private Map<Integer, Integer> incarnationNumbers;
-    private Map<String, Set<Integer>> unreceivedBlocks;
+    final Map<Integer, Long> lastPingTimes;
+    final Map<Integer, Integer> incarnationNumbers;
+
+    final Map<String, Set<Integer>> unreceivedBlocks;
     private Boolean running;
     private Boolean serverMode; // Mode Flag: false = PingAck and true = PingAck+S
 
-    // File list of this server
-    private Set<String> localFiles;
-    private Map<String, Integer> fileBlockMap;
-    private LRUCache lruCache = new LRUCache(3);
+    final Set<String> localFiles; // Set of HyDFS files on this server
+    final Map<String, Integer> fileBlockMap;
+    final LRUCache lruCache;
+
+    // overhead
+    private long reReplicationStartTime;
+    private Set<String> pendingAcks = Collections.synchronizedSet(new HashSet<>());
 
     public Server(String[] args) throws IOException, NoSuchAlgorithmException {
         this.logger = Logger.getLogger("Server");
@@ -51,6 +54,7 @@ public class Server {
         this.ipAddress = args[1];
         this.portTCP = Integer.parseInt(args[2]);
         this.portUDP = Integer.parseInt(args[3]);
+        this.lruCache = new LRUCache(Integer.parseInt(args[4]));
         this.localFiles = new HashSet<>();
         this.fileBlockMap = new HashMap<>();
 
@@ -70,28 +74,42 @@ public class Server {
         logger.setLevel(Level.OFF);
 
         File directory = new File("HyDFS" + nodeId);
-        if(!directory.exists()) {
-            boolean created = directory.mkdir();
-            if(created) {
-                logger.info("HyDFS directory created");
-            }else{
-                logger.info("Failed to create HyDFS directory");
-            }
+        if (Files.exists(Paths.get(directory.getAbsolutePath()))) {
+            deleteDirectoryRecursively(Paths.get(directory.getAbsolutePath()));
+        }
+        boolean created = directory.mkdir();
+        if(created) {
+            logger.info("HyDFS directory created");
         }else{
-            logger.info("HyDFS directory already exists");
+            logger.info("Failed to create HyDFS directory");
         }
         File cacheDirectory = new File("Cache" + nodeId);
-        if(!cacheDirectory.exists()){
-            boolean created = cacheDirectory.mkdir();
-            if(created) {
-                logger.info("Cache directory created");
-            }else{
-                logger.info("Failed to create cache directory");
-            }
+        if (Files.exists(Paths.get(cacheDirectory.getAbsolutePath()))) {
+            deleteDirectoryRecursively(Paths.get(cacheDirectory.getAbsolutePath()));
+        }
+        created = cacheDirectory.mkdir();
+        if(created) {
+            logger.info("Cache directory created");
         }else{
-            logger.info("Cache directory already exists");
+            logger.info("Failed to create cache directory");
         }
 
+    }
+
+    public void deleteDirectoryRecursively(Path path) throws IOException {
+        Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     public void tcpListen(){
@@ -104,7 +122,7 @@ public class Server {
                 String jsonString = reader.readLine();
                 if (jsonString != null) {
                     JSONObject receivedMessage = new JSONObject(jsonString);
-                    System.out.println(receivedMessage);
+                    // System.out.println(receivedMessage);
 
                     switch(receivedMessage.getString("type")) {
                         case "Join":
@@ -147,13 +165,11 @@ public class Server {
                             handleAppendMultiFiles(receivedMessage);
                             break;
                         case "Merge":
-                            new Thread(() -> {
-                                try {
-                                    handleMerge(receivedMessage);
-                                } catch (InterruptedException e) {
-                                    throw new RuntimeException(e);
-                                }
-                            }).start();
+                            handleMerge(receivedMessage);
+                            break;
+                        case "MergeRequest":
+                            System.out.println("*************");
+                            new Thread(() -> this.handleMergeRequest(receivedMessage)).start();
                             break;
                         case "MergeFile":
                             handleMergeFile(receivedMessage);
@@ -166,6 +182,9 @@ public class Server {
                             break;
                         case "SuspicionModeUpdate":
                             handleModeUpdate(receivedMessage);
+                            break;
+                        case "ReReplicationAck":  // overhead use
+                            handleReReplicationAck(receivedMessage);
                             break;
                     }
                 }
@@ -187,7 +206,6 @@ public class Server {
 
                 ByteArrayInputStream bais = new ByteArrayInputStream(packet.getData());
                 ObjectInputStream ois = new ObjectInputStream(bais);
-                // if(!running) break;
                 JSONObject receivedMessage = new JSONObject((String) ois.readObject()) ;
                 // System.out.println(receivedMessage);
                 switch(receivedMessage.getString("type")) {
@@ -217,13 +235,10 @@ public class Server {
         } else {
             System.out.println("Suspicion mode disabled");
         }
-
-        // Gossip to all nodes
         JSONObject suspicionMessage = new JSONObject();
         suspicionMessage.put("type", "SuspicionModeUpdate");
         suspicionMessage.put("suspicionMode", suspicionMode ? "enabled" : "disabled");
         suspicionMessage.put("gossipCount", 0);
-
         gossip(suspicionMessage, true);
     }
 
@@ -291,7 +306,6 @@ public class Server {
                 long currentTime = clock.millis();
                 if (!serverMode) {
                     if(currentTime - predecessorLastPingTime > 5000) {
-                        System.out.println(currentTime + " " + predecessorLastPingTime);
                         JSONObject failureMessage = new JSONObject();
                         failureMessage.put("type", "Failure");
                         failureMessage.put("nodeId", this.predecessorLastPingId);
@@ -299,7 +313,6 @@ public class Server {
                         gossip(failureMessage, true);
                     }
                     if(currentTime - successorLastPingTime > 5000) {
-                        System.out.println(currentTime + " " + successorLastPingTime);
                         JSONObject failureMessage = new JSONObject();
                         failureMessage.put("type", "Failure");
                         failureMessage.put("nodeId", this.successorLastPingId);
@@ -313,8 +326,6 @@ public class Server {
                         Node member = membershipManager.getNode(nodeId);
                         System.out.println(member == null ? "member is null" : "member id: " + member.getNodeId());
                         long lastPingTime = entry.getValue();
-
-                        System.out.println("Node ID: " + nodeId + "Last Ping Time: " + lastPingTime);
 
                         if (currentTime - lastPingTime > 3000 && member.getStatus().equals("alive")) {
                             JSONObject suspicionMessage = new JSONObject();
@@ -394,26 +405,30 @@ public class Server {
     }
 
     // Method to join the system by contacting other nodes
-    public void join(String introIpAddress, int introPort) throws IOException, InterruptedException {
-        running = true;
-        membershipManager.clear();
-        membershipManager.addNode(new Node(nodeId, ipAddress, portUDP, portTCP, "alive"));
-        JSONObject joinMessage = new JSONObject();
-        joinMessage.put("type", "Join");
-        joinMessage.put("nodeId", nodeId);
-        joinMessage.put("ipAddress", ipAddress);
-        joinMessage.put("portUDP", portUDP);
-        joinMessage.put("portTCP", portTCP);
+    public void join(String introIpAddress, int introPort){
+        try {
+            running = true;
+            membershipManager.clear();
+            membershipManager.addNode(new Node(nodeId, ipAddress, portUDP, portTCP, "alive"));
+            JSONObject joinMessage = new JSONObject();
+            joinMessage.put("type", "Join");
+            joinMessage.put("nodeId", nodeId);
+            joinMessage.put("ipAddress", ipAddress);
+            joinMessage.put("portUDP", portUDP);
+            joinMessage.put("portTCP", portTCP);
 
-        sendTCP(introIpAddress, introPort, joinMessage);
+            sendTCP(introIpAddress, introPort, joinMessage);
 
-        logger.info("Sent Join-Req Message");
+            logger.info("Sent Join-Req Message");
 
-        Thread.sleep(5000);
-        if(membershipManager.getSize() > 1){
-            logger.info("Join Succeeds");
-        }else{
-            logger.info("Join Failed for " + introIpAddress + ":" + introPort);
+            Thread.sleep(5000);
+            if(membershipManager.getSize() > 1){
+                logger.info("Join Succeeds");
+            }else{
+                logger.info("Join Failed for " + introIpAddress + ":" + introPort);
+            }
+        }catch (InterruptedException e) {
+            logger.warning("Thread interrupted" + e.getMessage());
         }
     }
 
@@ -428,49 +443,40 @@ public class Server {
         gossip(leaveMessage, true);
     }
 
-//    JSONObject createFileMessage = new JSONObject();
-//        createFileMessage.put("type", "CreateFile");
-//        createFileMessage.put("blockName", blockName);
 
-//        byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
-    //   byte[] blockData = Arrays.copyOfRange(fileContent, start, end);
+    public void createFile(String localFilename, String hydfsFilename) {
+        try {
+            if(fileBlockMap.containsKey(hydfsFilename)){
+                System.out.println("Filename already exists in HyDFS");
+                return;
+            }
+            fileBlockMap.put(hydfsFilename, 1);
+            int receiverId = ch.getServer( "1_" + hydfsFilename);
 
-//        createFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
-//
-//    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-//        writer.write(createFileMessage.toString());
-//        writer.newLine();
-//        writer.flush();
-    public void createFile(String localFilename, String hydfsFilename) throws IOException {
-        if(fileBlockMap.containsKey(hydfsFilename)){
-            System.out.println("Filename already exists in HyDFS");
-            return;
+            // Add to file set
+            // localFiles.add("1_" + hydfsFilename);
+
+            byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
+            byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
+
+            for (int memberId : Arrays.asList(receiverId, ch.getSuccessor(receiverId), ch.getSuccessor2(receiverId))) {
+                Node member = membershipManager.getNode(memberId);
+                JSONObject createFileMessage = new JSONObject();
+                createFileMessage.put("type", "CreateFile");
+                createFileMessage.put("hydfsFilename", hydfsFilename);
+                createFileMessage.put("blockNum", 1);
+                createFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
+                sendTCP(member.getIpAddress(), member.getPortTCP(), createFileMessage);
+            }
+            JSONObject updateFileMessage = new JSONObject();
+            updateFileMessage.put("type", "UpdateFile");
+            updateFileMessage.put("hydfsFilename", hydfsFilename);
+            updateFileMessage.put("blockNum", 1);
+            updateFileMessage.put("gossipCount", 0);
+            gossip(updateFileMessage, true);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
-        fileBlockMap.put(hydfsFilename, 1);
-        int receiverId = ch.getServer( "1_" + hydfsFilename);
-
-        // Add to file set
-        localFiles.add("1_" + hydfsFilename);
-
-        byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
-        byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
-
-        for (int memberId : Arrays.asList(receiverId, ch.getSuccessor(receiverId), ch.getSuccessor2(receiverId))) {
-            Node member = membershipManager.getNode(memberId);
-            JSONObject createFileMessage = new JSONObject();
-            createFileMessage.put("type", "CreateFile");
-            createFileMessage.put("hydfsFilename", hydfsFilename);
-            createFileMessage.put("blockNum", 1);
-            createFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
-            sendTCP(member.getIpAddress(), member.getPortTCP(), createFileMessage);
-        }
-        JSONObject updateFileMessage = new JSONObject();
-        updateFileMessage.put("type", "UpdateFile");
-        updateFileMessage.put("hydfsFilename", hydfsFilename);
-        updateFileMessage.put("blockNum", 1);
-        updateFileMessage.put("gossipCount", 0);
-        gossip(updateFileMessage, true);
-
     }
 
     public void getFile(String hydfsFilename, String localFilename) {
@@ -534,7 +540,7 @@ public class Server {
 
     public void appendFile(String localFilename, String hydfsFilename) {
         int blockId = fileBlockMap.get(hydfsFilename) + 1;
-        Node receiver = membershipManager.getNode(ch.getServer(blockId + "_" + hydfsFilename));
+        Node receiver = membershipManager.getNode(ch.getServer("1_" + hydfsFilename));
         try {
             byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
             JSONObject appendFileMessage = new JSONObject();
@@ -549,21 +555,22 @@ public class Server {
 
     }
 
-    public void appendMultiFiles(String hydfsFilename, String nodeIds, String localFilenames) throws IOException {
+    public void appendMultiFiles(String hydfsFilename, String nodeIds, String localFilenames) {
         String[] nodeIdArray = nodeIds.replaceAll("\\s", "").split(",");
         String[] localFilenameArray = localFilenames.replaceAll("\\s", "").split(",");
-        if (nodeIdArray.length != localFilenameArray.length) {
-            System.out.println("Please specify equal number of node IDs and local filepath");
+        if (nodeIdArray.length > localFilenameArray.length) {
+            System.out.println("Please specify number of node IDs <= number of local filepath");
             return;
         }
-        for (int i = 0; i < nodeIdArray.length; ++i) {
+
+        for (int i = 0; i < localFilenameArray.length; ++i) {
             JSONObject appendFileRequestMessage = new JSONObject();
             appendFileRequestMessage.put("type", "AppendFileRequest");
             appendFileRequestMessage.put("hydfsFilename", hydfsFilename);
             appendFileRequestMessage.put("localFilename", localFilenameArray[i]);
             Node receiver;
             try {
-                receiver = membershipManager.getNode(Integer.parseInt(nodeIdArray[i]));
+                receiver = membershipManager.getNode(Integer.parseInt(nodeIdArray[i % nodeIdArray.length]));
             } catch (NumberFormatException e) {
                 System.out.println("Please specify node IDs as integers");
                 return;
@@ -572,16 +579,48 @@ public class Server {
         }
     }
 
-    public void mergeFile(String hyDFSfilename) {
-        JSONObject mergeRequest = new JSONObject();
-        mergeRequest.put("type", "Merge");
-        mergeRequest.put("hydfsFilename", hyDFSfilename);
-        mergeRequest.put("requesterNodeId", this.nodeId);
-        mergeRequest.put("gossipCount", 0);
-
-        gossip(mergeRequest, true);
-        logger.info("Broadcasted merge request for " + hyDFSfilename + " to all nodes.");
+    public void multiappendAndMerge(String hydfsFilename, String nodeIds, String localFilenames) {
+        String[] nodeIdArray = nodeIds.replaceAll("\\s", "").split(",");
+        int targetBlockCount = fileBlockMap.getOrDefault(hydfsFilename, 0) + nodeIdArray.length;
+        long appendStartTime = clock.millis();
+        System.out.println("Multi-Append started at: " + appendStartTime);
+        appendMultiFiles(hydfsFilename, nodeIds, localFilenames);
+        while (fileBlockMap.getOrDefault(hydfsFilename, 0) < targetBlockCount) {
+            try {
+                logger.info("Current # of blocks" + fileBlockMap.getOrDefault(hydfsFilename, 0));
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        long appendEndTime = clock.millis();
+        System.out.println("Multi-Append completed at: " + appendEndTime);
+        long mergeStartTime = clock.millis();
+        System.out.println("Merge started at: " + mergeStartTime);
+        mergeFile(hydfsFilename);
+        while (fileBlockMap.getOrDefault(hydfsFilename, 0) != 1) {
+            try {
+                logger.info("Current # of blocks" + fileBlockMap.getOrDefault(hydfsFilename, 0));
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        long mergeEndTime = clock.millis();
+        System.out.println("Merge completed at: " + mergeEndTime);
+        System.out.println("Total time taken: " + (mergeEndTime - appendStartTime) + " ms");
     }
+
+    public void mergeFile(String hydfsFilename) {
+        JSONObject mergeRequest = new JSONObject();
+        mergeRequest.put("type", "MergeRequest");
+        mergeRequest.put("hydfsFilename", hydfsFilename);
+        mergeRequest.put("requesterNodeId", this.nodeId);
+        Node receiver = membershipManager.getNode(ch.getServer("1_" + hydfsFilename));
+        sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), mergeRequest);
+        logger.info("Sent merge request for " + hydfsFilename + " to node " + receiver.getNodeId());
+    }
+
 
     // vmAddress 应该是 ipaddr:port
     public void getFromReplica(String vmAddress, String hydfsFilename, String localFilename) {
@@ -714,49 +753,43 @@ public class Server {
 
 
     private void handleAppendFile(JSONObject message) {
-        try {
-            String hydfsFilename = message.getString("hydfsFilename");
-            int currentBlockNum = fileBlockMap.get(hydfsFilename);
-            int newBlockNum = currentBlockNum + 1;
-            if(newBlockNum > message.getInt("blockId")) {
-                Node receiver = membershipManager.getNode(ch.getServer(newBlockNum + "_" + hydfsFilename));
-                message.put("blockId", newBlockNum);
-                sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), message);
-            }else{
-                byte[] data = Base64.getDecoder().decode(message.getString("blockData"));
-                // Construct the file path for new block
-                String filePath = "HyDFS" + nodeId + "/" + newBlockNum + "_" + hydfsFilename;
-
-                Files.write(Paths.get(filePath), data);
-
-                fileBlockMap.put(hydfsFilename, newBlockNum);
-                logger.info("Appended block " + newBlockNum + " to file " + hydfsFilename + " and saved to " + filePath);
-
-                // Add to localFiles set
-                localFiles.add(newBlockNum + "_" + hydfsFilename);
-
-                // Create the file in current Node's successor and successor2
-                JSONObject createFileMessage = new JSONObject();
-                createFileMessage.put("type", "CreateFile");
-                createFileMessage.put("hydfsFilename", hydfsFilename);
-                createFileMessage.put("blockNum", newBlockNum);
-                createFileMessage.put("blockData", Base64.getEncoder().encodeToString(data));
-                Node successor = membershipManager.getNode(ch.getSuccessor(nodeId));
-                Node successor2 = membershipManager.getNode(ch.getSuccessor2(nodeId));
-                sendTCP(successor.getIpAddress(), successor.getPortTCP(), createFileMessage);
-                sendTCP(successor2.getIpAddress(), successor2.getPortTCP(), createFileMessage);
-
-                // Notify other member with new blockCount
-                JSONObject updateFileMessage = new JSONObject();
-                updateFileMessage.put("type", "UpdateFile");
-                updateFileMessage.put("hydfsFilename", hydfsFilename);
-                updateFileMessage.put("blockNum", newBlockNum);
-                updateFileMessage.put("gossipCount", 0);
-                gossip(updateFileMessage, true);
-            }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+        String hydfsFilename = message.getString("hydfsFilename");
+        int currentBlockNum = fileBlockMap.get(hydfsFilename);
+        int newBlockNum = currentBlockNum + 1;
+        if(newBlockNum > message.getInt("blockId")) {
+            message.put("blockId", newBlockNum);
         }
+        byte[] data = Base64.getDecoder().decode(message.getString("blockData"));
+            /*// Construct the file path for new block
+            String filePath = "HyDFS" + nodeId + "/" + newBlockNum + "_" + hydfsFilename;
+
+            Files.write(Paths.get(filePath), data);*/
+
+        fileBlockMap.put(hydfsFilename, newBlockNum);
+
+            /*// Add to localFiles set
+            localFiles.add(newBlockNum + "_" + hydfsFilename);*/
+
+        // Create the file in current Node's successor and successor2
+        JSONObject createFileMessage = new JSONObject();
+        createFileMessage.put("type", "CreateFile");
+        createFileMessage.put("hydfsFilename", hydfsFilename);
+        createFileMessage.put("blockNum", newBlockNum);
+        createFileMessage.put("blockData", Base64.getEncoder().encodeToString(data));
+        Node receiver = membershipManager.getNode(ch.getServer(newBlockNum + "_" + hydfsFilename));
+        Node successor = membershipManager.getNode(ch.getSuccessor(receiver.getNodeId()));
+        Node successor2 = membershipManager.getNode(ch.getSuccessor2(receiver.getNodeId()));
+        sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), createFileMessage);
+        sendTCP(successor.getIpAddress(), successor.getPortTCP(), createFileMessage);
+        sendTCP(successor2.getIpAddress(), successor2.getPortTCP(), createFileMessage);
+
+        // Notify other member with new blockCount
+        JSONObject updateFileMessage = new JSONObject();
+        updateFileMessage.put("type", "UpdateFile");
+        updateFileMessage.put("hydfsFilename", hydfsFilename);
+        updateFileMessage.put("blockNum", newBlockNum);
+        updateFileMessage.put("gossipCount", 0);
+        gossip(updateFileMessage, true);
 
     }
 
@@ -779,7 +812,9 @@ public class Server {
             // Add to the localFiles set
             localFiles.add(blockNum + "_" + hydfsFilename);
 
-            fileBlockMap.put(hydfsFilename, blockNum); // Initially, each file starts with one block
+            if (!fileBlockMap.containsKey(hydfsFilename) || blockNum > fileBlockMap.get(hydfsFilename)) {
+                fileBlockMap.put(hydfsFilename, blockNum); // Initially, each file starts with one block
+            }
             logger.info("Block " + blockNum + " of file " + hydfsFilename + " saved to " + filePath);
         } catch (IOException e) {
             logger.warning("Failed to save block to local HyDFS directory.");
@@ -789,7 +824,9 @@ public class Server {
     private void handleUpdateFile(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
         int blockNum = message.getInt("blockNum");
-        fileBlockMap.put(hydfsFilename, blockNum);
+        if (!fileBlockMap.containsKey(hydfsFilename) || blockNum > fileBlockMap.get(hydfsFilename)) {
+            fileBlockMap.put(hydfsFilename, blockNum);
+        }
         gossip(message, true);
     }
 
@@ -821,7 +858,6 @@ public class Server {
             int receivedIncarnation = message.getInt("incarnation");
             long currentTime = clock.millis();
             lastPingTimes.remove(senderNodeId);
-            System.out.println("Current lastPingTimes after ack removal node#: " + senderNodeId + " "+ lastPingTimes);
             logger.info("Received PingAck from node: " + senderNodeId);
 
             if (serverMode) {
@@ -914,14 +950,10 @@ public class Server {
         joinUpdateMessage.put("ipAddress", joiningNodeIp);
         joinUpdateMessage.put("portUDP", joiningNodePortUDP);
         joinUpdateMessage.put("portTCP", joiningNodePortTCP);
-        joinUpdateMessage.put("status", "alive");
+        joinUpdateMessage.put("gossipCount", 0);
 
         // Multicast to all members
-        for (Node member : membershipManager.getMembers().values()) {
-            if (member.getNodeId() != nodeId) {
-                sendTCP(member.getIpAddress(), member.getPortTCP(), joinUpdateMessage);
-            }
-        }
+        gossip(joinUpdateMessage, true);
 
         // Send back membership list to new joined node from introducer
         JSONObject memberUpdateMessage = new JSONObject();
@@ -957,6 +989,7 @@ public class Server {
         if (!incarnationNumbers.containsKey(joiningNodeId)) {
             incarnationNumbers.put(joiningNodeId, 0);
         }
+        gossip(message, true);
         logger.info("Node " + joiningNode.getNodeId() + " joined successfully");
     }
 
@@ -972,7 +1005,6 @@ public class Server {
             Set<String> localFilesCopy = new HashSet<>(localFiles);
             for (String localFile : localFilesCopy) {
                 Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
-                System.out.println(localFilePath);
                 int server1Id = ch.getServer(localFile);
                 int server2Id = ch.getSuccessor(server1Id);
                 int server3Id = ch.getSuccessor2(server1Id);
@@ -1015,34 +1047,53 @@ public class Server {
     }
 
 
-    private void handleFailure(JSONObject message) throws IOException {
+    private void handleFailure(JSONObject message) {
         int failedNodeId = message.getInt("nodeId");
-
         if(ch.getRingId(failedNodeId) != -1){
+
+            // overhead 测试：时间开始
+            long totalDataSent = 0;
+            reReplicationStartTime = clock.millis();
+            // overhead tracking set
+            pendingAcks.clear();
+
             // Loop through local files to create message for all files to be re-replicated
             List<JSONObject> recreateFileMessages = new ArrayList<>();
             Set<String> localFilesCopy = new HashSet<>(localFiles);
             for (String localFile : localFilesCopy) {
-                Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
-                System.out.println(localFilePath.toString());
-                int server1Id = ch.getServer(localFile);
-                int server2Id = ch.getSuccessor(server1Id);
-                int server3Id = ch.getSuccessor2(server1Id);
-                if (server1Id == failedNodeId || server2Id == failedNodeId || server3Id == failedNodeId) {
-                    byte[] fileContent = Files.readAllBytes(localFilePath);
-                    byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
-                    JSONObject recreateFileMessage = new JSONObject();
-                    recreateFileMessage.put("type", "RecreateFile");
-                    recreateFileMessage.put("blockName", localFile);
-                    recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
-                    recreateFileMessages.add(recreateFileMessage);
-                    Files.deleteIfExists(localFilePath);
-                    localFiles.remove(localFile);
+                try {
+                    Path localFilePath = Paths.get("HyDFS" + nodeId + "/" + localFile);
+                    int server1Id = ch.getServer(localFile);
+                    int server2Id = ch.getSuccessor(server1Id);
+                    int server3Id = ch.getSuccessor2(server1Id);
+                    if (server1Id == failedNodeId || server2Id == failedNodeId || server3Id == failedNodeId) {
+                        byte[] fileContent = Files.readAllBytes(localFilePath);
+                        byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
+
+                        // overhead：发送的数据
+                        totalDataSent += blockData.length * 3L;
+
+
+                        JSONObject recreateFileMessage = new JSONObject();
+                        recreateFileMessage.put("type", "RecreateFile");
+                        recreateFileMessage.put("blockName", localFile);
+                        recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
+                        recreateFileMessage.put("originatorNodeId", nodeId); //overhead use
+                        recreateFileMessages.add(recreateFileMessage);
+
+                        Files.deleteIfExists(localFilePath);
+                        localFiles.remove(localFile);
+                    }
+                } catch (Exception e) {
+                    System.out.println("Exception occur in handleFailure: " + e.getMessage());
+                    e.printStackTrace();
                 }
+
             }
             // 在consistent hashing ring 和 membership manager当中删除掉这个节点
             ch.removeServer(failedNodeId);
             membershipManager.removeNode(failedNodeId);
+            System.out.println("Membership: " + membershipManager.getMembers().keySet());
             incarnationNumbers.remove(failedNodeId);
             lastPingTimes.remove(failedNodeId);
             logger.info("Node " + failedNodeId + " marked as failed node and removed from membership list and ring");
@@ -1059,10 +1110,33 @@ public class Server {
                 Node receiver2 = membershipManager.getNode(ch.getSuccessor(receiver1.getNodeId()));
                 Node receiver3 = membershipManager.getNode(ch.getSuccessor(receiver2.getNodeId()));
                 for (Node member : Arrays.asList(receiver1, receiver2, receiver3)) {
+                    // overhead
+                    String ackId = recreateFileMessage.getString("blockName") + "_" + member.getNodeId();
+                    pendingAcks.add(ackId);
+                    recreateFileMessage.put("ackId", ackId);
+
                     sendTCP(member.getIpAddress(), member.getPortTCP(), recreateFileMessage);
                 }
             }
+
+
+            new Thread(() -> monitorReReplicationCompletion()).start();
+            System.out.println("Total data sent during re-replication: " + totalDataSent + " bytes");
         }
+    }
+
+    private void monitorReReplicationCompletion() {
+        while (!pendingAcks.isEmpty()) {
+            try {
+                Thread.sleep(100); // 每隔100毫秒检查一次
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        long reReplicationEndTime = System.currentTimeMillis();
+        long totalReReplicationTime = reReplicationEndTime - reReplicationStartTime;
+        System.out.println("Total re-replication time upon failure: " + totalReReplicationTime + " ms");
     }
 
     public void handleRecreateFile(JSONObject message) {
@@ -1076,10 +1150,29 @@ public class Server {
             // Add to localFiles
             localFiles.add(blockName);
             logger.info("Recreated block " + blockName + " and saved to local storage at " + filePath);
+
+            // 发送ack回
+            int originatorNodeId = message.getInt("originatorNodeId");
+            String ackId = message.getString("ackId");
+            JSONObject ackMessage = new JSONObject();
+            ackMessage.put("type", "ReReplicationAck");
+            ackMessage.put("ackId", ackId);
+
+            Node originatorNode = membershipManager.getNode(originatorNodeId);
+            if (originatorNode != null) {
+                sendTCP(originatorNode.getIpAddress(), originatorNode.getPortTCP(), ackMessage);
+            }
+
         } catch (IOException e) {
             logger.warning("Failed to recreate block " + message.getString("blockName") + ": " + e.getMessage());
         }
 
+    }
+
+    // overhead use
+    private void handleReReplicationAck(JSONObject message) {
+        String ackId = message.getString("ackId");
+        pendingAcks.remove(ackId);
     }
 
     private void handleMembershipList(JSONObject message) {
@@ -1105,61 +1198,79 @@ public class Server {
                 incarnationNumbers.put(memberId, 0);
             }
         }
-
+        System.out.println("Join successfully");
         logger.info("Update membership List completed from introducer");
     }
 
 
-    private void handleMerge(JSONObject message) throws InterruptedException {
+    private void handleMerge(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
         String firstBlockName = "1_" + hydfsFilename;
-        int requesterNodeId = message.getInt("requesterNodeId");
-        int blockNum = fileBlockMap.get(hydfsFilename);
-        // If the current node is the one storing block 1 for hydfsFilename
-        if (ch.getServer(firstBlockName) == nodeId) {
+        gossip(message, true);
+        if (this.nodeId == ch.getServer(firstBlockName)) return;
+        try {
+            for (int i = 2; i <= fileBlockMap.get(hydfsFilename); ++i) {
+                if (localFiles.contains(i + "_" + hydfsFilename)) {
+                    byte[] fileContent = Files.readAllBytes(Paths.get("HyDFS" + nodeId + "/" + i + "_" + hydfsFilename));
+                    JSONObject mergeFileMessage = new JSONObject();
+                    mergeFileMessage.put("type", "MergeFile");
+                    mergeFileMessage.put("hydfsFilename", hydfsFilename);
+                    mergeFileMessage.put("blockName", i + "_" + hydfsFilename);
+                    mergeFileMessage.put("blockData", Base64.getEncoder().encodeToString(fileContent));
+                    mergeFileMessage.put("blockId", i);
+                    Node receiver = membershipManager.getNode(ch.getServer(firstBlockName));
+                    sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), mergeFileMessage);
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void handleMergeRequest(JSONObject message) {
+        try {
+            System.out.println("Received merge request at time: " + clock.millis());
+            String hydfsFilename = message.getString("hydfsFilename");
+            int requesterNodeId = message.getInt("requesterNodeId");
+            int blockNum = fileBlockMap.get(hydfsFilename);
+            String firstBlockName = "1_" + hydfsFilename;
             // Add all unreceived blocks to unreceivedBlocks[hydfsFilename]
-            unreceivedBlocks.clear();
             unreceivedBlocks.put(hydfsFilename, new HashSet<>());
             for (int i = 1; i <= blockNum; ++i) {
                 if (!localFiles.contains(i + "_" + hydfsFilename)) {
                     unreceivedBlocks.get(hydfsFilename).add(i);
                 }
             }
+            JSONObject mergeFileMessage = new JSONObject();
+            mergeFileMessage.put("type", "Merge");
+            mergeFileMessage.put("hydfsFilename", hydfsFilename);
+            mergeFileMessage.put("gossipCount", 0);
+            gossip(mergeFileMessage, true);
             // Wait until all blocks are received
             while(!unreceivedBlocks.get(hydfsFilename).isEmpty()){
-                Thread.sleep(1000);
+                Thread.sleep(100);
             }
             // Append all blocks to 1_hydfsFilename and send RecreateFile requests to successors
             List<String> blockFiles = new ArrayList<>();
             for(int i = 2; i <= blockNum; ++i){
                 blockFiles.add("HyDFS" + nodeId + "/" + i + "_" + hydfsFilename);
             }
-            try (BufferedWriter writer = new BufferedWriter(new FileWriter("HyDFS" + nodeId + "/" + firstBlockName, true))) {
+            try(BufferedWriter writer = new BufferedWriter(new FileWriter("HyDFS" + nodeId + "/" + firstBlockName, true))){
                 for(String blockFile: blockFiles){
                     Path blockFilePath = Paths.get(blockFile);
-                    for(String line : Files.readAllLines(blockFilePath)){
-                        System.out.println(line);
-                        writer.write(line);
-                        writer.newLine();
-                    }
+                    writer.write(Files.readString(blockFilePath));
                     Files.deleteIfExists(blockFilePath);
                 }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
             }
-            try {
-                byte[] fileContent = Files.readAllBytes(Paths.get("HyDFS" + nodeId + "/" + firstBlockName));
-                JSONObject recreateFileMessage = new JSONObject();
-                recreateFileMessage.put("type", "RecreateFile");
-                recreateFileMessage.put("blockName", firstBlockName);
-                recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(fileContent));
-                Node successor1 = membershipManager.getNode(ch.getSuccessor(nodeId));
-                Node successor2 = membershipManager.getNode(ch.getSuccessor2(nodeId));
-                sendTCP(successor1.getIpAddress(), successor1.getPortTCP(), recreateFileMessage);
-                sendTCP(successor2.getIpAddress(), successor2.getPortTCP(), recreateFileMessage);
-            }catch (IOException e) {
-                throw new RuntimeException();
-            }
+            byte[] fileContent = Files.readAllBytes(Paths.get("HyDFS" + nodeId + "/" + firstBlockName));
+            JSONObject recreateFileMessage = new JSONObject();
+            recreateFileMessage.put("type", "RecreateFile");
+            recreateFileMessage.put("blockName", firstBlockName);
+            recreateFileMessage.put("blockData", Base64.getEncoder().encodeToString(fileContent));
+            Node successor1 = membershipManager.getNode(ch.getSuccessor(nodeId));
+            Node successor2 = membershipManager.getNode(ch.getSuccessor2(nodeId));
+            sendTCP(successor1.getIpAddress(), successor1.getPortTCP(), recreateFileMessage);
+            sendTCP(successor2.getIpAddress(), successor2.getPortTCP(), recreateFileMessage);
             // Gossip MergeAck messages
             JSONObject mergeAckMessage = new JSONObject();
             mergeAckMessage.put("type", "MergeAck");
@@ -1167,53 +1278,39 @@ public class Server {
             mergeAckMessage.put("hydfsFilename", hydfsFilename);
             mergeAckMessage.put("gossipCount", 0);
             gossip(mergeAckMessage, true);
-        // If the current not does not store block 1 for hydfsFilename
-        }else{
-            try{
-                for (int i = 2; i <= blockNum; ++i) {
-                    if (localFiles.contains(i + "_" + hydfsFilename)) {
-                        byte[] fileContent = Files.readAllBytes(Paths.get("HyDFS" + nodeId + "/" + i + "_" + hydfsFilename));
-                        byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
-                        JSONObject mergeFileMessage = new JSONObject();
-                        mergeFileMessage.put("type", "MergeFile");
-                        mergeFileMessage.put("hydfsFilename", hydfsFilename);
-                        mergeFileMessage.put("blockName", i + "_" + hydfsFilename);
-                        mergeFileMessage.put("blockData", Base64.getEncoder().encodeToString(blockData));
-                        mergeFileMessage.put("blockId", i);
-                        Node receiver = membershipManager.getNode(ch.getServer(firstBlockName));
-                        sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), mergeFileMessage);
-                    }
-                }
-            }catch (IOException e){
-                throw new RuntimeException(e);
-            }
+            System.out.println("Completed merge at : " + clock.millis());
+        } catch (IOException | InterruptedException e) {
+            throw new RuntimeException(e);
         }
+
     }
 
 
-    public void handleMergeAck(JSONObject message) {
+    private void handleMergeAck(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
         int requesterNodeId = message.getInt("requesterNodeId");
-
-        // 确认是不是block2及以上持有者
+        Path directoryPath = Paths.get("HyDFS" + nodeId);
+        gossip(message, true);
+        // Return if received the message the second time
+        if (fileBlockMap.get(hydfsFilename) == 1) return;
+        // Delete all blocks with id > 1
         Set<String> blocksToDelete = new HashSet<>();
-        for (String localFile : localFiles) {
-            if (!localFile.equals("1_" + hydfsFilename) && localFile.endsWith(hydfsFilename)) {
-                blocksToDelete.add(localFile);
+        for (int block = 2; block <= fileBlockMap.get(hydfsFilename); block++) {
+            String blockName = block + "_" + hydfsFilename;
+            Path blockPath = directoryPath.resolve(blockName);
+            if (Files.exists(blockPath)) {
+                blocksToDelete.add(blockName);
             }
         }
-        fileBlockMap.put(hydfsFilename, 1);
-        // 删除所有set当中的文件, 并且在localSet当中移除
         for (String block : blocksToDelete) {
             try {
                 Files.deleteIfExists(Paths.get("HyDFS" + nodeId + "/" + block));
                 localFiles.remove(block);
-                logger.info("Deleted " + block + " after merge confirmation.");
             } catch (IOException e) {
                 logger.warning("Failed to delete block " + block + ": " + e.getMessage());
             }
         }
-
+        fileBlockMap.put(hydfsFilename, 1);
         // Requester 打印确认信息
         if (this.nodeId == requesterNodeId) {
             System.out.println("Merge command for " + hydfsFilename + " completed successfully.");
@@ -1222,19 +1319,15 @@ public class Server {
 
     // 当block1持有者收到了block2+持有者发来的block信息的时候进行append处理
     public void handleMergeFile(JSONObject message) {
-        String blockName = message.getString("blockName");
-        int blockId = message.getInt("blockId");
-        String hyDFSFileName = message.getString("hydfsFilename");
-        byte[] blockData = Base64.getDecoder().decode(message.getString("blockData"));
-
-        String blockFilePath = "HyDFS" + nodeId + "/" + blockName;
-        Path path = Paths.get(blockFilePath);
-
         try {
-            if (!Files.exists(path)) {
-                Files.write(path, blockData);
+            String blockName = message.getString("blockName");
+            int blockId = message.getInt("blockId");
+            String hyDFSFileName = message.getString("hydfsFilename");
+            byte[] blockData = Base64.getDecoder().decode(message.getString("blockData"));
+            Path blockFilePath = Paths.get("HyDFS" + nodeId + "/" + blockName);
+            if (!Files.exists(blockFilePath)) {
+                Files.write(blockFilePath, blockData);
                 logger.info("Stored data for " + blockName + " under node ID: " + nodeId);
-
                 unreceivedBlocks.get(hyDFSFileName).remove(blockId);
             } else {
                 logger.info("Block " + blockName + " already exists locally, skipping storage.");
@@ -1255,6 +1348,21 @@ public class Server {
             writer.flush();
 
             logger.info("Send " + message.getString("type") + " message to" + receiverIp + ":" + receiverPort);
+        } catch (IOException e) {
+            logger.warning("Failed to send " + message.getString("type") + " message to " + receiverIp + ":" +
+                    receiverPort);
+        }
+    }
+
+    private void sendUDP(String receiverIp, int receiverPort, JSONObject message) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(baos);
+            oos.writeObject(message.toString());
+            byte[] buffer = baos.toByteArray();
+            InetAddress address = InetAddress.getByName(receiverIp);
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, receiverPort);
+            socket.send(packet);
         } catch (IOException e) {
             logger.warning("Failed to send " + message.getString("type") + " message to " + receiverIp + ":" +
                     receiverPort);
@@ -1290,22 +1398,18 @@ public class Server {
             } else {
                 sendUDP(member.getIpAddress(), member.getPortUDP(), message);
             }
-
         }
     }
 
-    private void sendUDP(String receiverIp, int receiverPort, JSONObject message) {
-        try (DatagramSocket socket = new DatagramSocket()) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            ObjectOutputStream oos = new ObjectOutputStream(baos);
-            oos.writeObject(message.toString());
-            byte[] buffer = baos.toByteArray();
-            InetAddress address = InetAddress.getByName(receiverIp);
-            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, receiverPort);
-            socket.send(packet);
-        } catch (IOException e) {
-            logger.warning("Failed to send " + message.getString("type") + " message to " + receiverIp + ":" +
-                    receiverPort);
+    public void multiCreate(int fileNumber, String filepath, String hydfsFilename) {
+        for(int i = 1; i <= fileNumber; i++) {
+            System.out.println(i);
+            createFile(filepath + "_" + i + ".txt", hydfsFilename + "_" + i + ".txt");
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 

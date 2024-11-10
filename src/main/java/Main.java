@@ -28,11 +28,13 @@ public class Main {
             String[] command = scanner.nextLine().split(" ");
             switch (command[0]){
                 case "join":
-                    System.out.println("Enter introducer IP address and port:");
-                    String addressAndPorts = scanner.nextLine();
-                    String address = addressAndPorts.split(":")[0];
-                    int port = Integer.parseInt(addressAndPorts.split(":")[1]);
-                    server.join(address, port);
+                    if (command.length == 2) {
+                        String address = command[1].split(":")[0];
+                        int port = Integer.parseInt(command[1].split(":")[1]);
+                        server.join(address, port);
+                    } else {
+                        System.out.println("Please specify the command as: join <IP Address>:<Port>");
+                    }
                     break;
                 case "leave":
                     server.leave();
@@ -112,6 +114,11 @@ public class Main {
                     break;
                 case "quit":
                     running = false;
+                    break;
+                case "multicreate":
+                    if (command.length == 4) {
+                        server.multiCreate(Integer.parseInt(command[1]), command[2], command[3]);
+                    }
                     break;
                 default:
                     System.out.println("Invalid command");

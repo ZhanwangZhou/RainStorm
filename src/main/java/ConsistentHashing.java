@@ -6,6 +6,12 @@ import java.util.ArrayList;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
+
+/*
+Ring data structure holding all nodes in HyDFS.
+Use consistent hashing to determine the ring ID of each node and
+the node where each file is stored.
+ */
 public class ConsistentHashing {
     private TreeMap<Long, Integer> ring;
     private MessageDigest md;
@@ -77,10 +83,6 @@ public class ConsistentHashing {
         ch.addServer(4);
         ch.addServer(5);
 
-//        System.out.println("successor of 3: " + ch.getSuccssor(3));
-//        System.out.println("predecessor of 3: " + ch.getPredecessor(3));
-//        System.out.println("successor of 4: " + ch.getSuccssor(4));
-//        System.out.println("predecessor of 4: " + ch.getPredecessor(4));
         System.out.println("successor of 1: " + ch.getSuccessor(1));
         System.out.println("successor of 4: " + ch.getSuccessor(4));
         System.out.println("successor of 3: " + ch.getSuccessor(3));

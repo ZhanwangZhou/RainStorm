@@ -2,6 +2,10 @@ package main.java;
 
 import java.io.Serializable;
 
+
+/*
+Store basic info for a single device in HyDFS.
+ */
 public class Node implements Serializable {
     private int nodeId;
     private String ipAddress;
@@ -14,7 +18,7 @@ public class Node implements Serializable {
         this.ipAddress = ipAddress;
         this.portUDP = portUDP;
         this.portTCP = portTCP;
-        this.status = status; // Initialize to be "Alive"
+        this.status = status;
     }
 
     public Node(int nodeId, String ipAddress, int portUDP, int portTCP) {
@@ -22,7 +26,7 @@ public class Node implements Serializable {
         this.ipAddress = ipAddress;
         this.portUDP = portUDP;
         this.portTCP = portTCP;
-        this.status = "alive"; // Initialize to be "Alive"
+        this.status = "alive";
     }
 
     public String getIpAddress(){

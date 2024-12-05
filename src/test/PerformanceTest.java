@@ -1,6 +1,6 @@
 package test;
 
-import main.java.Server;
+import main.java.hydfs.Server;
 
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;

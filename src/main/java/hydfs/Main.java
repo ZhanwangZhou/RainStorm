@@ -1,4 +1,4 @@
-package main.java;
+package main.java.hydfs;
 
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;

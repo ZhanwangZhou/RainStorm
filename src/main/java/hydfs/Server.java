@@ -1,4 +1,4 @@
-package main.java;
+package main.java.hydfs;
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -15,19 +15,19 @@ import java.util.logging.Logger;
 
 
 public class Server {
-    final int nodeId; // self node id
+    public final int nodeId; // self node id
     final String ipAddress; // self node's ip address
     final int portTCP; // self node's  tcp port
     final int portUDP; // self node's udp port
 
-    private Boolean running; //  if self node is running
+    public Boolean running; //  if self node is running
     private Boolean failureDetectionMode; // suspicion mode flag: false = heartbeat and true = PingAck+S
 
-    final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
+    public final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
     final LRUCache lruCache; // LRU cache storing recently read files
     final Set<String> localFiles; // set of HyDFS files on this server
     final Map<String, Integer> fileBlockMap; // map storing number of blocks of each HyDFS file
-    final HashMap<Integer, Node> membership; // membership of all nodes with node id as keys
+    public final HashMap<Integer, Node> membership; // membership of all nodes with node id as keys
     private long predecessorLastPingTime; // time of last ping received from the predecessor
     private int predecessorLastPingId; //  id of last pinging predecessor
     private long successorLastPingTime; // time of last ping received from the successor

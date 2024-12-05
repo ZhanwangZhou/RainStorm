@@ -1,4 +1,4 @@
-package main.java;
+package main.java.hydfs;
 import java.util.HashMap;
 
 

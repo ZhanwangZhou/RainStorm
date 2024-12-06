@@ -26,7 +26,7 @@ public class Server {
     public final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
     final LRUCache lruCache; // LRU cache storing recently read files
     final Set<String> localFiles; // set of HyDFS files on this server
-    final Map<String, Integer> fileBlockMap; // map storing number of blocks of each HyDFS file
+    public final Map<String, Integer> fileBlockMap; // map storing number of blocks of each HyDFS file
     public final HashMap<Integer, Node> membership; // membership of all nodes with node id as keys
     private long predecessorLastPingTime; // time of last ping received from the predecessor
     private int predecessorLastPingId; //  id of last pinging predecessor
@@ -365,6 +365,26 @@ public class Server {
         logger.info("Sent local file " + localFilename + " for HyDFS file creation.");
     }
 
+    public void createEmptyFile(String hydfsFilename) {
+        if(fileBlockMap.containsKey(hydfsFilename)){
+            System.out.println("Filename already exists in HyDFS");
+            return;
+        }
+        int receiverId = ch.getServer("1_" + hydfsFilename);
+        JSONObject createFileMessage = new JSONObject();
+        createFileMessage.put("type", "CreateFile");
+        createFileMessage.put("hydfsFilename", hydfsFilename);
+        createFileMessage.put("blockNum", 1);
+        createFileMessage.put("blockData", "");
+        for (int memberId : Arrays.asList(
+                receiverId, ch.getSuccessor(receiverId), ch.getSuccessor2(receiverId)
+        )) {
+            Node member = membership.get(memberId);
+            sendTCP(member.getIpAddress(), member.getPortTCP(), createFileMessage);
+        }
+        logger.info("Sent empty HyDFS file creation request.");
+    }
+
 
     /*
     Send "GetFile" request to nodes for their file blocks.
@@ -496,6 +516,38 @@ public class Server {
             logger.warning("Failed to read from local file " + localFilename);
         }
 
+    }
+
+    /*
+     * Append a String as a new block into a file
+     * Content: new string to append
+     * hydfsFilename: target hydfs filename
+     */
+    public void appendString(String content, String hydfsFilename) {
+        if (!fileBlockMap.containsKey(hydfsFilename)) {
+            System.out.println("The file to be appended does not exist in HyDFS.");
+            return;
+        }
+
+        // Determine the block num to append the content
+        int currentBlockNum = fileBlockMap.get(hydfsFilename);
+        int newBlockNum = currentBlockNum + 1;  // New block ID
+
+        // Prepare the append message
+        JSONObject appendFileMessage = new JSONObject();
+        appendFileMessage.put("type", "AppendFile");
+        appendFileMessage.put("hydfsFilename", hydfsFilename);
+        appendFileMessage.put("blockId", newBlockNum);
+        appendFileMessage.put("blockData", Base64.getEncoder().encodeToString(content.getBytes()));
+
+        Node receiver = membership.get(ch.getServer("1_" + hydfsFilename));
+
+        try {
+            sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), appendFileMessage);
+            System.out.println("String appended to HyDFS file " + hydfsFilename + ": " + content);
+        } catch (Exception e) {
+            logger.warning("Failed to append string to HyDFS file: " + e.getMessage());
+        }
     }
 
 

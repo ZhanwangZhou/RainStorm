@@ -8,6 +8,8 @@ import org.json.JSONObject;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.HashMap;
@@ -15,6 +17,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.*;
 
@@ -33,10 +36,13 @@ public class Leader {
     final Clock clock;
     private HashMap<Integer, Long> timeTable;  // key = uniqueId1, value = createdTime
     private HashMap<Integer, KeyValue> partitions;  // key=uniqueId1, value=KeyValue={filename:lineNumber, line}
-    private int uniqueId = 0;  // Global uniqueId1 for Op1 and Op2
+    private int uniqueId = 0;  // Global uniqueId for Op1 and Op2
+    private int appUniqueId = 0; // Gloabl uniqueId for RainStorm app
 
     private int stage1Counter = 0;  // Count total number of stage1 tasks
     private int stage2Counter = 0;  // Count total number of stage2 tasks
+
+    private HashMap<String, String> stage2Results = new HashMap<>();
 
     public String hydfsSrcFile;
     public String hydfsDestFilename;
@@ -53,6 +59,7 @@ public class Leader {
     public Leader(String[] args, int portTCP) throws IOException, NoSuchAlgorithmException {
         this.clock = Clock.systemDefaultZone();
         this.logger = Logger.getLogger("Leader");
+        logger.setLevel(Level.WARNING);
         this.scanner = new Scanner(System.in);
         this.portTCP = portTCP;
         this.membership = new HashMap<>();
@@ -64,14 +71,28 @@ public class Leader {
         this.availableWorkers = new ArrayList<>();
         this.available = true;
 
+
         // Start threads to listen to TCP/UDP messages
         server = new Server(args);
+        // Create "rainstorm" + server.nodeId directory if not exist
+        File directory = new File("rainstorm" + server.nodeId);
+        if (Files.exists(Paths.get(directory.getAbsolutePath()))) {
+            server.deleteDirectoryRecursively(Paths.get(directory.getAbsolutePath()));
+        }
+        boolean created = directory.mkdir();
+        if(created) {
+            logger.info("HyDFS directory created");
+        }else{
+            logger.info("Failed to create HyDFS directory");
+        }
+
         Thread serverTcpListen = new Thread(server::tcpListen);
         serverTcpListen.start();
         Thread serverUdpListen = new Thread(server::udpListen);
         serverUdpListen.start();
         Thread leaderListen = new Thread(this::tcpListen);
         leaderListen.start();
+
         // Start threads to periodically ping and check for failure detection
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1, TimeUnit.SECONDS);
@@ -182,6 +203,7 @@ public class Leader {
             System.out.println("Previous RainStorm application is still being processed");
             return;
         }
+        available = false;
         this.hydfsSrcFile = hydfsSrcFile;
         this.hydfsDestFilename = hydfsDestFilename;
         this.numTasks = numTasks;
@@ -233,8 +255,9 @@ public class Leader {
     }
 
     public void generateAndPartitionOp1(String sourceFilename) {
-        server.getFile(sourceFilename, sourceFilename);
-        try(BufferedReader reader = new BufferedReader(new FileReader(sourceFilename))) {
+        String localFilePath = "rainStorm" + server.nodeId + "/" + sourceFilename;
+        server.getFile(sourceFilename, localFilePath);
+        try(BufferedReader reader = new BufferedReader(new FileReader(localFilePath))) {
             String line;
             int lineNumber = 1;
             while ((line = reader.readLine()) != null) {
@@ -245,7 +268,8 @@ public class Leader {
                 String key = sourceFilename + ":" + lineNumber;
                 int workerIndex = Math.abs(key.hashCode()) % op1Workers.size();
                 int workerId = op1Workers.get(workerIndex);
-                KeyValue kv = new KeyValue(key, line, 1, "Op1Worker" + String.valueOf(workerIndex) + ".log");
+                KeyValue kv = new KeyValue(key, line, 1, "App" + appUniqueId +
+                        "Op1Worker" + workerIndex + ".log");
 
                 // Assign a uniqueId1 and call send partition
                 int partitionId = uniqueId++;
@@ -362,51 +386,82 @@ public class Leader {
      Handle received acknowledge from completed task and remove corresponding task from timeTable
      */
     private void handleAckFromWorker(JSONObject message) {
-        try {
-            int partitionId = message.getInt("id");
-            String type = message.getString("type");
-
-            // Remove corresponding partition id from timeTable
-            if (timeTable.containsKey(partitionId)) {
-                timeTable.remove(partitionId);
-                logger.info("Task complete for partition " + partitionId + ". Removed from timeout table.");
-            } else {
-                logger.warning("Received Task Complete for unknown partition " + partitionId);
-                return;
-            }
-
-//            if ("Stream1Ack".equals(type)) {  // Not an empty Ack, continue to next stage
-//                stage1Counter++;
-//                String newKey = message.getString("key");
-//                String newValue = message.getString("value");
-//
-//                System.out.println("Leader从Op1 Worker收到了Ack = Key : " + newKey + "和value :" + newValue);
-//
-//                // Generate Stage2 task and add to timeTable
-//                // Send Stage2 task to appropriate worker
-//                int workerIndex = Math.abs(newKey.hashCode()) % op2Workers.size();
-//                int workerId = op2Workers.get(workerIndex);
-//                int newPartitionId = uniqueId++;
-//                KeyValue kv = new KeyValue(newKey, newValue, 2, "Op2Worker" + String.valueOf(workerIndex) + ".log");
-//                partitions.put(partitionId, kv);
-//                timeTable.put(newPartitionId, clock.millis());
-//
-//                sendStream(newPartitionId, workerId);
-//
-//            } else if ("Stream1EmptyAck".equals(type)) {  // An empty Ack from stage1
-//                stage1Counter++;
-//            } else if ("Stream2Ack".equals(type)) {  // Stage2 Completed
-//                stage2Counter++;
-//            }
-
-            if (stage1Counter + stage2Counter == uniqueId) {
-                logger.info("All RainStorm tasks have been completed.");
-                available = true;
-                System.out.println("RainStorm processing completed successfully.");
-            }
-        } catch (Exception e) {
-            logger.warning("Error occurred when handling Ack from worker");
+        int partitionId = message.getInt("id");
+        String type = message.getString("type");
+        System.out.println("Leader从Worker收到了partition ID = " + partitionId);
+        // Remove corresponding partition id from timeTable
+        if (timeTable.containsKey(partitionId)) {
+            timeTable.remove(partitionId);
+            logger.info("Task complete for partition " + partitionId + ". Removed from timeout table.");
+        } else {
+            logger.warning("Received Task Complete for unknown partition " + partitionId);
+            return;
         }
+
+        if ("Stream1Ack".equals(type)) {  // Not an empty Ack, continue to next stage
+            stage1Counter++;
+            String newKey = message.getString("key");
+            String newValue = message.getString("value");
+
+            // Generate Stage2 task and add to timeTable
+            // Send Stage2 task to appropriate worker
+            int workerIndex = Math.abs(newKey.hashCode()) % op2Workers.size();
+            int workerId = op2Workers.get(workerIndex);
+            int newPartitionId = uniqueId++;
+            KeyValue kv = new KeyValue(newKey, newValue, 2, "App" + appUniqueId + "Op2Worker" + String.valueOf(workerIndex) + ".log");
+            partitions.put(newPartitionId, kv);
+            timeTable.put(newPartitionId, clock.millis());
+
+            sendStream(newPartitionId, workerId);
+
+        } else if ("Stream1EmptyAck".equals(type)) {  // An empty Ack from stage1
+            stage1Counter++;
+        } else if ("Stream2Ack".equals(type)) {  // Stage2 Completed
+            stage2Counter++;
+
+            // Write result into stage2Result hashmap
+            String finalKey = message.getString("key");
+            String finalValue = message.getString("value");
+            stage2Results.put(finalKey, finalValue);
+            logger.info("Received Stage2 Ack: Key=" + finalKey + ", Value=" + finalValue);
+        }
+
+        if (stage1Counter + stage2Counter == uniqueId) {
+            writeStage2ResultsToFile("rainstorm" + server.nodeId + "/" + hydfsDestFilename);
+            logger.info("All RainStorm tasks have been completed.");
+            notifyAllWorkersComplete();
+            available = true;
+            appUniqueId += 1;
+            System.out.println("RainStorm processing completed successfully.");
+
+        }
+    }
+
+    private void notifyAllWorkersComplete() {
+        JSONObject message = new JSONObject();
+        message.put("type", "Complete");
+
+        for (Map.Entry<Integer, Integer> entry : this.membership.entrySet()) {
+            int workerId = entry.getKey();
+            String workerIp = server.membership.get(workerId).getIpAddress();
+            int workerPort = entry.getValue();
+            sendTCP(workerIp, workerPort, message);
+            logger.info("Notified Worker " + workerId + " that all tasks are complete.");
+        }
+    }
+
+    private void writeStage2ResultsToFile(String filename) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(filename, true))){
+            logger.info("Writing Stage2 Results to local " + filename);
+            for (Map.Entry<String, String> entry : stage2Results.entrySet()) {
+                writer.write(entry.getKey() + ", " + entry.getValue());
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            logger.warning("Error occurred when writing Stage2 Results to " + filename);
+        }
+        server.createFile(filename, hydfsDestFilename);
+        logger.info("Writing Stage2 Results to hydfs " + filename);
     }
 
     private void handleWorkerJoin(JSONObject message) {

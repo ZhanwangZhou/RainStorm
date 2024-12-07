@@ -7,12 +7,15 @@ import org.apache.tools.ant.types.Commandline;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class Worker {
@@ -46,6 +49,7 @@ public class Worker {
         this.stream2 = new HashMap<>();
         this.streamQueue2 = new LinkedList<>();
         this.logger = Logger.getLogger("Worker");
+        logger.setLevel(Level.WARNING);
         this.scanner = new Scanner(System.in);
         this.tcpServerSocket = new ServerSocket(this.portTCP);
 
@@ -56,6 +60,18 @@ public class Worker {
 
         // Start threads to listen to TCP/UDP messages
         server = new Server(Arrays.copyOfRange(args, 0, 5));
+        // Initialize a directory to store rainStorm log files
+        File directory = new File("rainStorm" + server.nodeId);
+        if (Files.exists(Paths.get(directory.getAbsolutePath()))) {
+            server.deleteDirectoryRecursively(Paths.get(directory.getAbsolutePath()));
+        }
+        boolean created = directory.mkdir();
+        if(created) {
+            logger.info("HyDFS directory created");
+        }else{
+            logger.info("Failed to create HyDFS directory");
+        }
+
         Thread serverTcpListen = new Thread(server::tcpListen);
         serverTcpListen.start();
         Thread serverUdpListen = new Thread(server::udpListen);
@@ -64,8 +80,8 @@ public class Worker {
         workerListen.start();
         Thread workerExecuteStream1 = new Thread(this::executeStream1);
         workerExecuteStream1.start();
-        // Thread workerExecuteStream2 = new Thread(this::executeStream2);
-        // workerExecuteStream2.start();
+        Thread workerExecuteStream2 = new Thread(this::executeStream2);
+        workerExecuteStream2.start();
         // Start threads to periodically ping and check for failure detection
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1, TimeUnit.SECONDS);
@@ -90,6 +106,23 @@ public class Worker {
                         System.out.println("Please specify the command as:");
                         System.out.println("join <Leader Server IP Address>:<Leader Server Port> <Leader Port>");
                     }
+                    break;
+                case "create":
+                    if (command.length == 3) {
+                        server.createFile(command[1], command[2]);
+                    } else {
+                        System.out.println("Please specify the command as:");
+                        System.out.println("create <Local Filepath> <HyDFS Filename>");
+                    }
+                    break;
+                case "queue":
+                    System.out.println(streamQueue1);
+                    System.out.println(streamQueue2);
+                    break;
+                case "quit":
+                    serverTcpListen.interrupt();
+                    serverUdpListen.interrupt();
+                    workerListen.interrupt();
                     break;
             }
         }
@@ -125,6 +158,9 @@ public class Worker {
                     case "WorkerJoinAck":
                         handleWorkerJoinAck(receivedMessage);
                         break;
+                    case "Complete":
+                        handleComplete(receivedMessage);
+                        break;
                 }
             }
         }catch(IOException e){
@@ -132,7 +168,7 @@ public class Worker {
         }
     }
 
-    private List<String> executeStateful(int id, JSONObject info) {
+    private List<String> executeStateful(int id, JSONObject info, int stage) {
         String key = info.getString("key");
         String value = info.getString("value");
         String op = info.getString("op");
@@ -142,33 +178,47 @@ public class Worker {
         }
         String currentState = "";
 
-        if (stashedOutputs1.containsKey(key)) {
+        if (stage == 1 && stashedOutputs1.containsKey(key)) {
             currentState = stashedOutputs1.get(key);
+        } else if (stage == 2 && stashedOutputs2.containsKey(key)){
+            currentState = stashedOutputs2.get(key);
         } else {
-            server.getFile(destFile, destFile);
-            try(BufferedReader reader = new BufferedReader(new FileReader(destFile))) {
+            String localFilename = "rainStorm" + server.nodeId + "/" + destFile;
+            server.getFile(destFile, localFilename);
+            try(BufferedReader reader = new BufferedReader(new FileReader(localFilename))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     int index1 = line.indexOf("<Key>=");
                     int index2 = line.indexOf("<Value>=");
+                    String keyInLine = line.substring(index1 + 6, index2);
+                    if (keyInLine.equals(key)) {
+                        currentState = line.substring(index2 + 8);
+                    }
                 }
+                Files.deleteIfExists(Paths.get(localFilename));
             } catch (IOException e) {
-                logger.warning("Failed to read log file " + destFile);
+                System.out.println(localFilename);
+                logger.warning("Failed to read log file " + e.getMessage());
             }
         }
-        String cli = op + " '" + value + "' '" + currentState + "'";
-        List<String> outputs = execute(cli);
-        return outputs;
+        // key = key.indexOf(' ') == -1? key : "'" + key + "'";
+        // value = value.indexOf(' ') == -1? value : "'" + value + "'";
+        // currentState = currentState.indexOf(' ') == -1? currentState : "'" + currentState + "'";
+        String[] cli = {op, key, value, currentState};
+        return execute(cli);
     }
 
     private List<String> executeStateless(int id, JSONObject info) {
+        String key = info.getString("key");
         String value = info.getString("value");
         String op = info.getString("op");
         String destFile = info.getString("destFile");
         if (!server.fileBlockMap.containsKey(destFile)) {
             server.createEmptyFile(destFile);
         }
-        String cli = op + " '" + value + "'";
+        // key = key.indexOf(' ') == -1? key : "'" + key + "'";
+        // value = value.indexOf(' ') == -1? value : "'" + value + "'";
+        String[] cli = {op, key, value};
         return execute(cli);
     }
 
@@ -181,7 +231,7 @@ public class Worker {
                 int id = streamQueue1.poll();
                 JSONObject partition = stream1.get(id);
                 if (partition.getBoolean("stateful")) {
-                    outputs = executeStateful(id, stream1.get(id));
+                    outputs = executeStateful(id, stream1.get(id), 1);
                 } else {
                     outputs = executeStateless(id, stream1.get(id));
                 }
@@ -190,15 +240,17 @@ public class Worker {
                     ackMessage.put("type", "Stream1EmptyAck");
                     ackMessage.put("id", id);
                     sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
-                } else {
+                } else if (outputs.size() == 2) {
                     String key = outputs.get(0);
                     String value = outputs.get(1);
                     stashedOutputs1.put(key, value);
                     stashedIds1.put(id, key);
+                } else {
+                    logger.warning("Unexpected output from stream1.");
                 }
             }
             try {
-                Thread.sleep(100);
+                Thread.sleep(50);
             } catch (InterruptedException e) {
                 logger.warning("stream 1 execution interrupted");
             }
@@ -214,7 +266,7 @@ public class Worker {
                 int id = streamQueue2.poll();
                 JSONObject partition = stream2.get(id);
                 if (partition.getBoolean("stateful")) {
-                    outputs = executeStateful(id, stream2.get(id));
+                    outputs = executeStateful(id, stream2.get(id), 2);
                 } else {
                     outputs = executeStateless(id, stream2.get(id));
                 }
@@ -223,15 +275,17 @@ public class Worker {
                     ackMessage.put("type", "Stream2EmptyAck");
                     ackMessage.put("id", id);
                     sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
-                } else {
+                } else if (outputs.size() == 2) {
                     String key = outputs.get(0);
                     String value = outputs.get(1);
                     stashedOutputs2.put(key, value);
                     stashedIds2.put(id, key);
+                } else {
+                    logger.warning("Unexpected output from stream2.");
                 }
             }
             try {
-                Thread.sleep(100);
+                Thread.sleep(50);
             } catch (InterruptedException e) {
                 logger.warning("stream 1 execution interrupted");
             }
@@ -273,6 +327,8 @@ public class Worker {
                 JSONObject ackMessage = new JSONObject();
                 ackMessage.put("type", "Stream2Ack");
                 ackMessage.put("id", id);
+                ackMessage.put("key", key);
+                ackMessage.put("value", value);
                 ackMessages.add(ackMessage);
             }
             for (String destFile: updates.keySet()) {
@@ -299,7 +355,7 @@ public class Worker {
                 logger.info("Received new partition: ID=" + partitionId + ", Value="
                         + message.getString("value"));
             } else {
-                logger.warning("Duplicate partition received: ID=" + partitionId);
+                logger.info("Duplicate partition received: ID=" + partitionId);
             }
         } else if (message.getInt("stage") == 2){
             if (!stream2.containsKey(partitionId)) {
@@ -308,7 +364,7 @@ public class Worker {
                 logger.info("Received new partition: ID=" + partitionId + ", Value="
                         + message.getString("value"));
             } else {
-                logger.warning("Duplicate partition received: ID=" + partitionId);
+                logger.info("Duplicate partition received: ID=" + partitionId);
             }
         }
     }
@@ -323,12 +379,32 @@ public class Worker {
         System.out.println("Successfully joined Leader as Worker");
     }
 
-    private List<String> execute(String arg) {
+    private void handleComplete(JSONObject message) {
+        stream1.clear();
+        stashedIds1.clear();
+        stashedOutputs1.clear();
+        streamQueue1.clear();
+        stream2.clear();
+        stashedIds2.clear();
+        stashedOutputs2.clear();
+        streamQueue2.clear();
+        logger.info("Received \"Complete\" message from the leader.");
+        System.out.println("Complete all streams");
+    }
+
+    private List<String> execute(String[] args) {
         List<String> outputs = new ArrayList<>();
         try{
             Runtime rt = Runtime.getRuntime();
-            String[] args = Commandline.translateCommandline(arg);
-            Process proc = rt.exec(args);
+            String[] args0 = Commandline.translateCommandline(args[0]);
+            String[] newArgs = new String[args.length - 1 + args0.length];
+            for(int i = 0; i < args0.length; i++) {
+                newArgs[i] = args0[i];
+            }
+            for(int i = 1; i < args.length; i++) {
+                newArgs[i + args0.length - 1] = args[i];
+            }
+            Process proc = rt.exec(newArgs);
             BufferedReader stdInput = new BufferedReader(new
                     InputStreamReader(proc.getInputStream()));
             BufferedReader stdError = new BufferedReader(new
@@ -341,11 +417,11 @@ public class Worker {
             }
             // Read any errors from the attempted command
             while ((temp = stdError.readLine()) != null) {
-                logger.warning("Error while executing command" + args + ": " + temp);
+                logger.warning("Error while executing command" + Arrays.toString(args) + ": " + temp);
             }
 
         }catch (IOException e) {
-            logger.warning("Cannot read from command output of " + arg + "\n" + e.getMessage());
+            logger.warning("Cannot read from command output of " + Arrays.toString(args) + "\n" + e.getMessage());
         }
         return outputs;
     }
@@ -369,17 +445,3 @@ public class Worker {
     }
 }
 
-/*
-JSONObject AckMessage = new JSONObject();
-        AckMessage.put("id", id);
-        if(outputs.isEmpty()) {
-            AckMessage.put("type", "StreamEmptyAck");
-            sendTCP(server.membership.get(leaderNodeId).getIpAddress(), leaderPortTCP, AckMessage);
-            return;
-        }
-
-        AckMessage.put("type", "StreamAck");
-        AckMessage.put("id", id);
-        AckMessage.put("key", outputs.get(0));
-        AckMessage.put("value", outputs.get(1));
- */

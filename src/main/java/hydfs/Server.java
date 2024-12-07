@@ -21,6 +21,7 @@ public class Server {
     final int portUDP; // self node's udp port
 
     public Boolean running; //  if self node is running
+    public Boolean locked; // if self node is processing a command
     private Boolean failureDetectionMode; // suspicion mode flag: false = heartbeat and true = PingAck+S
 
     public final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
@@ -35,6 +36,7 @@ public class Server {
     final Map<Integer, Long> lastPingTimes; // each node's time of last ping
     final Map<Integer, Integer> incarnationNumbers; // each node's local incarnation number
     final Map<String, Set<Integer>> unreceivedBlocks; // unreceived block during get and merge
+    final Map<String, Boolean> unreceivedBlockLocks;
     private Thread tempThread = null;
 
     final ServerSocket tcpServerSocket;
@@ -53,6 +55,7 @@ public class Server {
         this.lruCache = new LRUCache(Integer.parseInt(args[4]));
 
         this.running = true;
+        this.locked = false;
         this.failureDetectionMode = false;
 
         this.ch = new ConsistentHashing();
@@ -62,6 +65,7 @@ public class Server {
         this.lastPingTimes = new HashMap<>();
         this.incarnationNumbers = new HashMap<>();
         this.unreceivedBlocks = new HashMap<>();
+        this.unreceivedBlockLocks = new HashMap<>();
 
         this.tcpServerSocket = new ServerSocket(portTCP);
         this.logger = Logger.getLogger("Server");
@@ -131,6 +135,9 @@ public class Server {
                         break;
                     case "CreateFile":
                         handleCreateFile(receivedMessage);
+                        break;
+                    case "CreateFileResponse":
+                        handleCreateFileResponse(receivedMessage);
                         break;
                     case "UpdateFile":
                         handleUpdateFile(receivedMessage);
@@ -340,6 +347,7 @@ public class Server {
     Disseminate "UpdateFile" message to inform all nodes of the file update
      */
     public void createFile(String localFilename, String hydfsFilename) {
+        lock();
         if(fileBlockMap.containsKey(hydfsFilename)){
             System.out.println("Filename already exists in HyDFS");
             return;
@@ -347,6 +355,7 @@ public class Server {
         int receiverId = ch.getServer("1_" + hydfsFilename);
         JSONObject createFileMessage = new JSONObject();
         createFileMessage.put("type", "CreateFile");
+        createFileMessage.put("nodeId", nodeId);
         createFileMessage.put("hydfsFilename", hydfsFilename);
         createFileMessage.put("blockNum", 1);
         try {
@@ -366,6 +375,7 @@ public class Server {
     }
 
     public void createEmptyFile(String hydfsFilename) {
+        lock();
         if(fileBlockMap.containsKey(hydfsFilename)){
             System.out.println("Filename already exists in HyDFS");
             return;
@@ -373,6 +383,7 @@ public class Server {
         int receiverId = ch.getServer("1_" + hydfsFilename);
         JSONObject createFileMessage = new JSONObject();
         createFileMessage.put("type", "CreateFile");
+        createFileMessage.put("nodeId", nodeId);
         createFileMessage.put("hydfsFilename", hydfsFilename);
         createFileMessage.put("blockNum", 1);
         createFileMessage.put("blockData", "");
@@ -392,6 +403,7 @@ public class Server {
     Copy the cache file to specified local file path.
      */
     public void getFile(String hydfsFilename, String localFilename) {
+        lock();
         // If the file is not inside HyDFS, return
         if(!fileBlockMap.containsKey(hydfsFilename)) {
             System.out.println("The file to be gotten does not exist in HyDFS");
@@ -403,16 +415,18 @@ public class Server {
         if(fileBlockMap.get(hydfsFilename) != lruCache.get(hydfsFilename)){
             int blockNum = fileBlockMap.get(hydfsFilename);
             unreceivedBlocks.put(hydfsFilename, new HashSet<>());
+            unreceivedBlockLocks.put(hydfsFilename, false);
             for(int i = 1; i <= blockNum; ++i) unreceivedBlocks.get(hydfsFilename).add(i);
             // Keep sending "GetFile" request until all blocks are received
             int secondsPassed = 0;
             while(!unreceivedBlocks.get(hydfsFilename).isEmpty()){
                 if(secondsPassed % 3 == 0) {
-                    for(int i: unreceivedBlocks.get(hydfsFilename)) {
+                    unreceivedBlockLocks.put(hydfsFilename, true);
+                    for (int i : unreceivedBlocks.get(hydfsFilename)) {
                         Node receiver = membership.get(ch.getServer(i + "_" + hydfsFilename));
-                        if(secondsPassed % 9 == 3) {
+                        if (secondsPassed % 9 == 3) {
                             receiver = membership.get(ch.getSuccessor(receiver.getNodeId()));
-                        } else if(secondsPassed % 9 == 6) {
+                        } else if (secondsPassed % 9 == 6) {
                             receiver = membership.get(ch.getSuccessor2(receiver.getNodeId()));
                         }
                         JSONObject getFileMessage = new JSONObject();
@@ -423,6 +437,7 @@ public class Server {
                         getFileMessage.put("blockName", i + "_" + hydfsFilename);
                         sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), getFileMessage);
                     }
+                    unreceivedBlockLocks.put(hydfsFilename, false);
                 }
                 secondsPassed += 1;
                 try {
@@ -472,6 +487,7 @@ public class Server {
             logger.warning("Failed to copy cache file to local path " + localFilename);
         }
         System.out.println("Succeed to get " + localFilename + " from HyDFS file " + hydfsFilename);
+        locked = false;
     }
 
 
@@ -544,7 +560,7 @@ public class Server {
 
         try {
             sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), appendFileMessage);
-            System.out.println("String appended to HyDFS file " + hydfsFilename + ": " + content);
+            logger.info("String appended to HyDFS file " + hydfsFilename + ": " + content);
         } catch (Exception e) {
             logger.warning("Failed to append string to HyDFS file: " + e.getMessage());
         }
@@ -940,6 +956,9 @@ public class Server {
             return;
         }
         localFiles.add(blockNum + "_" + hydfsFilename);
+        JSONObject responseMessage = new JSONObject();
+        responseMessage.put("type", "CreateFileResponse");
+        responseMessage.put("hydfsFilename", hydfsFilename);
         // Update fileBlockMap only if message blockNum is higher to avoid conflict on multi-append
         if (!fileBlockMap.containsKey(hydfsFilename) || blockNum > fileBlockMap.get(hydfsFilename)) {
             fileBlockMap.put(hydfsFilename, blockNum);
@@ -950,7 +969,23 @@ public class Server {
             updateFileMessage.put("gossipCount", 0);
             gossip(updateFileMessage, true);
             logger.info("Block " + blockNum + "_" + hydfsFilename + " has been saved to this node");
+            responseMessage.put("succeed", true);
+        } else {
+            responseMessage.put("succeed", false);
         }
+        Node receiver = membership.get(message.getInt("nodeId"));
+        sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), responseMessage);
+    }
+
+
+    private void handleCreateFileResponse(JSONObject message) {
+        if(message.getBoolean("succeed")) {
+            logger.info("Succeed to create hydfsFile " + message.getString("hydfsFilename"));
+        } else {
+            logger.info("Fail to create hydfsFile " + message.getString("hydfsFilename") +
+                    " due to conflict");
+        }
+        locked = false;
     }
 
 
@@ -962,8 +997,8 @@ public class Server {
         int blockNum = message.getInt("blockNum");
         if (!fileBlockMap.containsKey(hydfsFilename) || blockNum > fileBlockMap.get(hydfsFilename)) {
             fileBlockMap.put(hydfsFilename, blockNum);
-            System.out.println("New block of " + hydfsFilename + "created.");
-            System.out.println("Current block number = " + blockNum);
+            logger.info("New block of " + hydfsFilename + " created.");
+            logger.info("Current block number = " + blockNum);
         }
         gossip(message, true);
     }
@@ -1010,6 +1045,13 @@ public class Server {
         } catch (IOException e) {
             logger.warning("Failed to write " + blockName + " while handling GetFileResponse");
             return;
+        }
+        while(unreceivedBlockLocks.get(hydfsFilename)) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         unreceivedBlocks.get(hydfsFilename).remove(blockId);
         logger.info("Received and cached block of file " + blockName);
@@ -1080,6 +1122,7 @@ public class Server {
         // Create the file in current Node's successor and successor2
         JSONObject createFileMessage = new JSONObject();
         createFileMessage.put("type", "CreateFile");
+        createFileMessage.put("nodeId", nodeId);
         createFileMessage.put("hydfsFilename", hydfsFilename);
         createFileMessage.put("blockNum", newBlockNum);
         createFileMessage.put("blockData", Base64.getEncoder().encodeToString(data));
@@ -1386,7 +1429,7 @@ public class Server {
     /*
     Helper function to recursively delete directories.
      */
-    private void deleteDirectoryRecursively(Path path) throws IOException {
+    public void deleteDirectoryRecursively(Path path) throws IOException {
         Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
@@ -1400,6 +1443,24 @@ public class Server {
                 return FileVisitResult.CONTINUE;
             }
         });
+    }
+
+
+    private void lock() {
+        int counter = 0;
+        while (locked) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            ++counter;
+            if(counter == 100) {
+                System.out.println("Locked and waiting");
+                counter = 0;
+            }
+        }
+        locked = true;
     }
 
 
@@ -1417,7 +1478,7 @@ public class Server {
                     + receiverIp + ":" + receiverPort);
         } catch (IOException e) {
             logger.warning("Failed to send " + message.getString("type") + " message to "
-                    + receiverIp + ":" + receiverPort);
+                    + receiverIp + ":" + receiverPort + e.getMessage());
         }
     }
 

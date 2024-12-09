@@ -347,9 +347,10 @@ public class Server {
     Disseminate "UpdateFile" message to inform all nodes of the file update
      */
     public void createFile(String localFilename, String hydfsFilename) {
-        lock();
+        lock("createFile");
         if(fileBlockMap.containsKey(hydfsFilename)){
             System.out.println("Filename already exists in HyDFS");
+            locked = false;
             return;
         }
         int receiverId = ch.getServer("1_" + hydfsFilename);
@@ -363,6 +364,7 @@ public class Server {
             createFileMessage.put("blockData", Base64.getEncoder().encodeToString(fileContent));
         } catch (IOException e) {
             logger.warning("Failed to read from the local file" + localFilename + e.getMessage());
+            locked = false;
             return;
         }
         for (int memberId : Arrays.asList(
@@ -375,9 +377,10 @@ public class Server {
     }
 
     public void createEmptyFile(String hydfsFilename) {
-        lock();
+        lock("createEmptyFile");
         if(fileBlockMap.containsKey(hydfsFilename)){
             System.out.println("Filename already exists in HyDFS");
+            locked = false;
             return;
         }
         int receiverId = ch.getServer("1_" + hydfsFilename);
@@ -403,10 +406,11 @@ public class Server {
     Copy the cache file to specified local file path.
      */
     public void getFile(String hydfsFilename, String localFilename) {
-        lock();
+        lock("getFile");
         // If the file is not inside HyDFS, return
         if(!fileBlockMap.containsKey(hydfsFilename)) {
             System.out.println("The file to be gotten does not exist in HyDFS");
+            locked = false;
             return;
         }
         String cacheFilename = "Cache" + nodeId + "/" + hydfsFilename;
@@ -452,6 +456,7 @@ public class Server {
                 Files.deleteIfExists(cacheFilePath);
             }catch(IOException e) {
                 logger.warning("Failed to delete outdated cache file" + cacheFilename);
+                locked = false;
                 return;
             }
             logger.info("Delete outdated cache file of " + hydfsFilename);
@@ -857,6 +862,7 @@ public class Server {
         if (!incarnationNumbers.containsKey(joiningNodeId)) {
             incarnationNumbers.put(joiningNodeId, 0);
         }
+        reReplication(ch.getSuccessor(joiningNodeId), false);
         logger.info("Node " + joiningNode.getNodeId() + " joined successfully");
         if(!message.has("gossipCount")) {
             message.put("gossipCount", 0);
@@ -873,6 +879,14 @@ public class Server {
                 membersArray.put(memberInfo);
             }
             joinResponseMessage.put("members", membersArray);
+            JSONArray fileBlockArray = new JSONArray();
+            for (String hydfsFilename: fileBlockMap.keySet()) {
+                JSONObject fileBlockInfo = new JSONObject();
+                fileBlockInfo.put("hydfsFilename", hydfsFilename);
+                fileBlockInfo.put("blockNum", fileBlockMap.get(hydfsFilename));
+                fileBlockArray.put(fileBlockInfo);
+            }
+            joinResponseMessage.put("fileBlockMap", fileBlockArray);
             sendTCP(joiningNodeIp, joiningNodePortTCP, joinResponseMessage);
             logger.info("Send membership update message to new joined node" + joiningNodeId);
         }
@@ -902,6 +916,14 @@ public class Server {
                 incarnationNumbers.put(memberId, 0);
             }
         }
+        JSONArray fileBlockArray = message.getJSONArray("fileBlockMap");
+        fileBlockMap.clear();
+        for (int i = 0; i < fileBlockArray.length(); i++) {
+            JSONObject fileBlockInfo = fileBlockArray.getJSONObject(i);
+            String hydfsFilename = fileBlockInfo.getString("hydfsFilename");
+            int blockNum = fileBlockInfo.getInt("blockNum");
+            fileBlockMap.put(hydfsFilename, blockNum);
+        }
         System.out.println("Join successfully");
         logger.info("Finish updating membership List from introducer");
     }
@@ -914,7 +936,7 @@ public class Server {
     private void handleLeave(JSONObject message) {
         int leftNodeId = message.getInt("nodeId");
         if(ch.getRingId(leftNodeId) != -1) {
-            reReplicationOnDrop(leftNodeId);
+            reReplication(leftNodeId, true);
             membership.get(leftNodeId).setStatus("leave");
             System.out.println("Node" + leftNodeId + " has left. Set its status to \"leave\"");
             gossip(message, true);
@@ -929,7 +951,7 @@ public class Server {
     private void handleFailure(JSONObject message) {
         int failedNodeId = message.getInt("nodeId");
         if(ch.getRingId(failedNodeId) != -1){
-            reReplicationOnDrop(failedNodeId);
+            reReplication(failedNodeId, true);
             membership.remove(failedNodeId);
             incarnationNumbers.remove(failedNodeId);
             lastPingTimes.remove(failedNodeId);
@@ -967,7 +989,10 @@ public class Server {
             updateFileMessage.put("hydfsFilename", hydfsFilename);
             updateFileMessage.put("blockNum", blockNum);
             updateFileMessage.put("gossipCount", 0);
-            gossip(updateFileMessage, true);
+            for (int receiverNodeId: membership.keySet()) {
+                Node receiverNode = membership.get(receiverNodeId);
+                sendTCP(receiverNode.getIpAddress(), receiverNode.getPortTCP(), updateFileMessage);
+            }
             logger.info("Block " + blockNum + "_" + hydfsFilename + " has been saved to this node");
             responseMessage.put("succeed", true);
         } else {
@@ -1000,7 +1025,6 @@ public class Server {
             logger.info("New block of " + hydfsFilename + " created.");
             logger.info("Current block number = " + blockNum);
         }
-        gossip(message, true);
     }
 
 
@@ -1346,7 +1370,7 @@ public class Server {
     Check if this node stores any replicas previously stored by the dropped node.
     If it does, send "RecreateFile" request to the new locations to store the replicas.
      */
-    private void reReplicationOnDrop(int droppedNodeId){
+    private void reReplication(int replNodeId, boolean dropped){
         // Loop through local files to create "RecreateFile" message for all files to be re-replicated
         List<JSONObject> recreateFileMessages = new ArrayList<>();
         Set<String> localFilesCopy = new HashSet<>(localFiles);
@@ -1356,7 +1380,8 @@ public class Server {
                 int server1Id = ch.getServer(localFile);
                 int server2Id = ch.getSuccessor(server1Id);
                 int server3Id = ch.getSuccessor2(server1Id);
-                if (server1Id == droppedNodeId || server2Id == droppedNodeId || server3Id == droppedNodeId) {
+                if ((dropped && (server1Id == replNodeId || server2Id == replNodeId || server3Id == replNodeId))
+                || (!dropped && server1Id != nodeId && server2Id != nodeId && server3Id != nodeId)) {
                     byte[] fileContent = Files.readAllBytes(localFilePath);
                     byte[] blockData = Arrays.copyOfRange(fileContent, 0, fileContent.length);
                     JSONObject recreateFileMessage = new JSONObject();
@@ -1371,7 +1396,7 @@ public class Server {
                 System.out.println("Exception occur in handleFailure re-replication: " + e.getMessage());
             }
         }
-        ch.removeServer(droppedNodeId);
+        if (dropped) ch.removeServer(replNodeId);
         // Send "RecreateFile" messages and file data to the new server to store the file
         for(JSONObject recreateFileMessage : recreateFileMessages){
             Node receiver1 = membership.get(
@@ -1446,7 +1471,7 @@ public class Server {
     }
 
 
-    private void lock() {
+    private void lock(String methodName) {
         int counter = 0;
         while (locked) {
             try {
@@ -1456,7 +1481,7 @@ public class Server {
             }
             ++counter;
             if(counter == 100) {
-                System.out.println("Locked and waiting");
+                System.out.println("Locked and waiting in " + methodName);
                 counter = 0;
             }
         }
@@ -1469,7 +1494,7 @@ public class Server {
      */
     private void sendTCP(String receiverIp, int receiverPort, JSONObject message){
         try (Socket socket = new Socket(receiverIp, receiverPort)) {
-            socket.setSoTimeout(5000);
+            socket.setSoTimeout(10000);
             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
             writer.write(message.toString());
             writer.newLine();

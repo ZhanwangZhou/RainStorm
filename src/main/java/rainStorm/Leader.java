@@ -1,6 +1,5 @@
 package main.java.rainStorm;
 
-import main.java.hydfs.ConsistentHashing;
 import main.java.hydfs.Node;
 import main.java.hydfs.Server;
 import org.json.JSONObject;
@@ -14,9 +13,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.*;
@@ -34,7 +31,7 @@ public class Leader {
     private Scanner scanner;
 
     final Clock clock;
-    private HashMap<Integer, Long> timeTable;  // key = uniqueId1, value = createdTime
+    private ConcurrentHashMap<Integer, Long> timeTable;  // key = uniqueId1, value = createdTime
     private HashMap<Integer, KeyValue> partitions;  // key=uniqueId1, value=KeyValue={filename:lineNumber, line}
     private int uniqueId = 0;  // Global uniqueId for Op1 and Op2
     private int appUniqueId = 0; // Gloabl uniqueId for RainStorm app
@@ -52,6 +49,9 @@ public class Leader {
     public boolean op2Stateful;
     int numTasks;
     boolean available; // if there is any RainStorm task being processed
+    boolean readingSrcFile; // if the leader is reading src file
+
+    private HashMap<Integer, Integer> completionCount;  // key = partitionId; value = count
 
 
     final ServerSocket tcpServerSocket;
@@ -64,18 +64,20 @@ public class Leader {
         this.portTCP = portTCP;
         this.membership = new HashMap<>();
         this.partitions = new HashMap<>();
-        this.timeTable = new HashMap<>();
+        this.timeTable = new ConcurrentHashMap<>();
         this.tcpServerSocket = new ServerSocket(this.portTCP);
         this.op1Workers = new ArrayList<>();
         this.op2Workers = new ArrayList<>();
         this.availableWorkers = new ArrayList<>();
         this.available = true;
+        this.readingSrcFile = false;
+        this.completionCount = new HashMap<>();
 
 
         // Start threads to listen to TCP/UDP messages
         server = new Server(args);
-        // Create "rainstorm" + server.nodeId directory if not exist
-        File directory = new File("rainstorm" + server.nodeId);
+        // Create "rainStorm" + server.nodeId directory if not exist
+        File directory = new File("rainStorm" + server.nodeId);
         if (Files.exists(Paths.get(directory.getAbsolutePath()))) {
             server.deleteDirectoryRecursively(Paths.get(directory.getAbsolutePath()));
         }
@@ -97,7 +99,7 @@ public class Leader {
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(server::checkPing, 1, 1, TimeUnit.SECONDS);
-        scheduler.scheduleAtFixedRate(this::checkTimeTable, 0, 3, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::checkTimeTable, 0, 2, TimeUnit.SECONDS);
 
 
 
@@ -165,6 +167,10 @@ public class Leader {
                         System.out.println("append <Local Filepath> <HyDFS Filename>");
                     }
                     break;
+                case "workers":
+                    System.out.println(op1Workers);
+                    System.out.println(op2Workers);
+                    break;
             }
         }
     }
@@ -203,7 +209,19 @@ public class Leader {
             System.out.println("Previous RainStorm application is still being processed");
             return;
         }
+        // Clear cache
         available = false;
+        availableWorkers.clear();
+        op1Workers.clear();
+        op2Workers.clear();
+        stage2Results.clear();
+        partitions.clear();
+        timeTable.clear();
+        uniqueId = 0;
+        stage1Counter = 0;
+        stage2Counter = 0;
+        completionCount.clear();
+
         this.hydfsSrcFile = hydfsSrcFile;
         this.hydfsDestFilename = hydfsDestFilename;
         this.numTasks = numTasks;
@@ -216,7 +234,9 @@ public class Leader {
         this.op2 = scanner.nextLine();
         System.out.println("Is op2_exe stateful? <true/false>");
         op2Stateful = Boolean.parseBoolean(scanner.nextLine());
+        readingSrcFile = true;
         generateAndPartitionOp1(hydfsSrcFile);
+        readingSrcFile = false;
     }
 
     private void initializeAllAvailableMembers() {
@@ -267,7 +287,6 @@ public class Leader {
                 }
                 String key = sourceFilename + ":" + lineNumber;
                 int workerIndex = Math.abs(key.hashCode()) % op1Workers.size();
-                int workerId = op1Workers.get(workerIndex);
                 KeyValue kv = new KeyValue(key, line, 1, "App" + appUniqueId +
                         "Op1Worker" + workerIndex + ".log");
 
@@ -275,7 +294,7 @@ public class Leader {
                 int partitionId = uniqueId++;
                 partitions.put(partitionId, kv);
                 timeTable.put(partitionId, clock.millis());
-                sendStream(partitionId, workerId);
+                sendStream(partitionId);
                 lineNumber++;
             }
             logger.info("Successfully read and send all kvs from source: " + sourceFilename);
@@ -285,7 +304,17 @@ public class Leader {
     }
 
 
-    private void sendStream(int partitionId, int workerId) {
+    private void sendStream(int partitionId) {
+        String key = partitions.get(partitionId).getKey();
+        int stage = partitions.get(partitionId).getStage();
+        List<Integer> workers = (stage == 1) ? op1Workers : op2Workers;
+        int workerIndex = Math.abs(key.hashCode()) % workers.size();
+        int workerId = workers.get(workerIndex);
+
+        while (!server.membership.containsKey(workerId)) {
+            reassign(workerId);
+            workerId = workers.get(workerIndex);
+        };
         String workerIp = server.membership.get(workerId).getIpAddress();
         int workerPort = this.membership.get(workerId);
 
@@ -309,76 +338,61 @@ public class Leader {
         logger.info("Partition " + partitionId + " with key '" + partitions.get(partitionId).getKey() + "' sent to worker " + workerId);
     }
 
+    private void reassign(int failedWorkerId) {
+        logger.warning("Reassigning failed Worker " + failedWorkerId);
+        membership.remove(failedWorkerId);
+        availableWorkers.remove((Integer) failedWorkerId);
+        int index1 = op1Workers.indexOf(failedWorkerId);
+        int index2 = op2Workers.indexOf(failedWorkerId);
+        if (index1 != -1 ) {
+            int replacedWorkerId = findReplacementWorker(1);
+            if(replacedWorkerId != -1) op1Workers.set(index1, replacedWorkerId);
+            logger.info("Replaced failed Op1 worker " + failedWorkerId + " with new worker " + replacedWorkerId);
+        }
+        if (index2 != -1 ) {
+            int replacedWorkerId = findReplacementWorker(2);
+            if(replacedWorkerId != -1) op2Workers.set(index2, replacedWorkerId);
+            logger.info("Replaced failed Op2 worker " + failedWorkerId + " with new worker " + replacedWorkerId);
+        }
+    }
+
 
     /*
      This method is going to check if assigned task timeout
      */
     private void checkTimeTable() {
         long currentTime = clock.millis();
-        List<Integer> timedOutPartitions = new ArrayList<>();
         // Get all timeOut partitions
         for (Map.Entry<Integer, Long> entry : timeTable.entrySet()) {
             int partitionId = entry.getKey();
             long assignedTime = entry.getValue();
-            if (currentTime - assignedTime >= 5000) {
-                timedOutPartitions.add(partitionId);
+            if (currentTime - assignedTime >= 10000) {
+                // System.out.println("Resend stream for partitionID = " + partitionId);
+                sendStream(partitionId);
+                timeTable.put(partitionId, clock.millis());
             }
-        }
-
-        for (int partitionId : timedOutPartitions) {
-            KeyValue kv = partitions.get(partitionId);
-            if (kv == null) {
-                logger.warning("Partition ID " + partitionId + " not found in partitions map.");
-                continue;
-            }
-            timeTable.remove(partitionId);
-
-            int stage = kv.getStage();
-            String key = kv.getKey();
-            String value = kv.getValue();
-            String destFile = kv.getDestFile();
-
-            // Determine which group of worker it belongs to
-            List<Integer> workers = (stage == 1) ? op1Workers : op2Workers;
-            // Check for failed workers and reassign if necessary
-            int workerIndex = Math.abs(key.hashCode()) % workers.size();
-            int failedWorkerId = workers.get(workerIndex);
-
-            if (!server.membership.containsKey(failedWorkerId)) {
-                logger.warning("Worker " + failedWorkerId + " failed. Reassigning task for partition " + partitionId);
-
-                int newWorkerId = findReplacementWorker();
-
-                if (newWorkerId != -1) {
-                    // Replace failed worker with new worker
-                    op1Workers.set(workerIndex, newWorkerId);
-                    logger.info("Replaced failed worker " + failedWorkerId + " with new worker " + newWorkerId);
-                } else {
-                    // Remove the failed worker from op1Workers
-                    logger.warning("No replacement worker found. Removing failed worker " + failedWorkerId);
-                    workers.remove(workerIndex);
-                    availableWorkers.remove((Integer) failedWorkerId);
-                }
-            }
-            // Resend Partition Task
-            int newWorkerIndex = Math.abs(key.hashCode()) % workers.size();
-            int newWorkerId = workers.get(newWorkerIndex);
-            sendStream(partitionId, newWorkerId);
-            timeTable.put(partitionId, clock.millis());
         }
     }
+
 
     /*
      Helper method to find a replacement worker.
      Looks for a worker in the membership list not in op1Workers or op2Workers.
     */
-    private int findReplacementWorker() {
-        for (Map.Entry<Integer, Node> member : server.membership.entrySet()) {
-            int memberId = member.getKey();
-            if (!op1Workers.contains(memberId) && !op2Workers.contains(memberId)) {
+    private int findReplacementWorker(int stage) {
+        List<Integer> failedWorkers = stage == 1? op1Workers : op2Workers;
+        List<Integer> otherWorkers = stage == 1? op2Workers : op1Workers;
+        for (int memberId : server.membership.keySet()) {
+            if (server.nodeId != memberId && !op1Workers.contains(memberId) && !op2Workers.contains(memberId)) {
                 return memberId;
             }
         }
+        for (int workerId : otherWorkers) {
+            if (!failedWorkers.contains(workerId)) {
+                return workerId;
+            }
+        }
+        logger.warning("Failed to find a replacement worker for stage " + stage);
         return -1;
     }
 
@@ -386,16 +400,27 @@ public class Leader {
      Handle received acknowledge from completed task and remove corresponding task from timeTable
      */
     private void handleAckFromWorker(JSONObject message) {
+        while(readingSrcFile) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         int partitionId = message.getInt("id");
         String type = message.getString("type");
-        System.out.println("Leader从Worker收到了partition ID = " + partitionId);
+        // add to completion count for debugging
+        completionCount.put(partitionId, completionCount.getOrDefault(partitionId, 0) + 1);
+        if (completionCount.get(partitionId) > 1) {
+            System.out.println("!过程发现重复Ack: partitionId = " + partitionId + " Count = " + completionCount.get(partitionId));
+            return;
+        }
+
+        // System.out.println("Leader从Worker收到了partition ID = " + partitionId);
         // Remove corresponding partition id from timeTable
         if (timeTable.containsKey(partitionId)) {
             timeTable.remove(partitionId);
             logger.info("Task complete for partition " + partitionId + ". Removed from timeout table.");
-        } else {
-            logger.warning("Received Task Complete for unknown partition " + partitionId);
-            return;
         }
 
         if ("Stream1Ack".equals(type)) {  // Not an empty Ack, continue to next stage
@@ -406,13 +431,12 @@ public class Leader {
             // Generate Stage2 task and add to timeTable
             // Send Stage2 task to appropriate worker
             int workerIndex = Math.abs(newKey.hashCode()) % op2Workers.size();
-            int workerId = op2Workers.get(workerIndex);
             int newPartitionId = uniqueId++;
-            KeyValue kv = new KeyValue(newKey, newValue, 2, "App" + appUniqueId + "Op2Worker" + String.valueOf(workerIndex) + ".log");
+            KeyValue kv = new KeyValue(newKey, newValue, 2, "App" + appUniqueId + "Op2Worker" + workerIndex + ".log");
             partitions.put(newPartitionId, kv);
             timeTable.put(newPartitionId, clock.millis());
 
-            sendStream(newPartitionId, workerId);
+            sendStream(newPartitionId);
 
         } else if ("Stream1EmptyAck".equals(type)) {  // An empty Ack from stage1
             stage1Counter++;
@@ -424,15 +448,26 @@ public class Leader {
             String finalValue = message.getString("value");
             stage2Results.put(finalKey, finalValue);
             logger.info("Received Stage2 Ack: Key=" + finalKey + ", Value=" + finalValue);
+        } else if ("Stream2EmptyAck".equals(type)) {
+            stage2Counter++;
+        }
+
+        if ((stage1Counter + stage2Counter) % 50 == 0 || stage1Counter + stage2Counter >= uniqueId) {
+            System.out.println("Received # Ack = " + (stage1Counter + stage2Counter) + " / " + uniqueId);
         }
 
         if (stage1Counter + stage2Counter == uniqueId) {
-            writeStage2ResultsToFile("rainstorm" + server.nodeId + "/" + hydfsDestFilename);
+            writeStage2ResultsToFile("rainStorm" + server.nodeId + "/" + hydfsDestFilename);
             logger.info("All RainStorm tasks have been completed.");
             notifyAllWorkersComplete();
             available = true;
             appUniqueId += 1;
             System.out.println("RainStorm processing completed successfully.");
+            for (Map.Entry<Integer, Integer> entry : completionCount.entrySet()) {
+                if (entry.getValue() > 1) {
+                    System.out.println("!发现重复Ack: partitionId = " + entry.getKey() + " Count = " + entry.getValue());
+                }
+            }
 
         }
     }
@@ -451,7 +486,7 @@ public class Leader {
     }
 
     private void writeStage2ResultsToFile(String filename) {
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(filename, true))){
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(filename))){
             logger.info("Writing Stage2 Results to local " + filename);
             for (Map.Entry<String, String> entry : stage2Results.entrySet()) {
                 writer.write(entry.getKey() + ", " + entry.getValue());

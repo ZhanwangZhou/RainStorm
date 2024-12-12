@@ -7,7 +7,6 @@ import org.json.*;
 
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.*;
 import java.util.logging.Level;
@@ -39,7 +38,6 @@ public class Server {
     final Map<String, Boolean> unreceivedBlockLocks;
     private Thread tempThread = null;
 
-    final ServerSocket tcpServerSocket;
     final Logger logger;
     final Clock clock;
 
@@ -47,7 +45,7 @@ public class Server {
     /*
     Server class constructor
      */
-    public Server(String[] args) throws IOException, NoSuchAlgorithmException {
+    public Server(String[] args) {
         this.nodeId = Integer.parseInt(args[0]);
         this.ipAddress = args[1];
         this.portTCP = Integer.parseInt(args[2]);
@@ -67,7 +65,6 @@ public class Server {
         this.unreceivedBlocks = new HashMap<>();
         this.unreceivedBlockLocks = new HashMap<>();
 
-        this.tcpServerSocket = new ServerSocket(portTCP);
         this.logger = Logger.getLogger("Server");
         this.clock = Clock.systemDefaultZone();
 
@@ -86,7 +83,8 @@ public class Server {
         if(created) {
             logger.info("HyDFS directory created");
         }else{
-            logger.info("Failed to create HyDFS directory");
+            logger.info("ERROR: Failed to create HyDFS directory");
+            System.exit(1);
         }
         // Initialize a directory to cache recently read files
         File cacheDirectory = new File("Cache" + nodeId);
@@ -97,7 +95,8 @@ public class Server {
         if(created) {
             logger.info("Cache directory created");
         }else{
-            logger.info("Failed to create cache directory");
+            logger.info("ERROR: Failed to create cache directory");
+            System.exit(1);
         }
     }
 
@@ -108,7 +107,7 @@ public class Server {
      */
     public void tcpListen() {
         logger.info("Start TCP Listen");
-        try{
+        try (ServerSocket tcpServerSocket = new ServerSocket(portTCP)) {
             while(running){
                 Socket tcpSocket = tcpServerSocket.accept();
                 tcpSocket.setSoTimeout(5000);
@@ -182,7 +181,7 @@ public class Server {
                         logger.warning("Unknown message type: " + messageType);
                 }
             }
-        }catch(IOException e){
+        } catch(IOException e) {
             logger.info("Cannot read from TCP packet\n" + e.getMessage());
         }
     }
@@ -1454,20 +1453,24 @@ public class Server {
     /*
     Helper function to recursively delete directories.
      */
-    public void deleteDirectoryRecursively(Path path) throws IOException {
-        Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                Files.delete(file);
-                return FileVisitResult.CONTINUE;
-            }
+    public void deleteDirectoryRecursively(Path path) {
+        try {
+            Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
 
-            @Override
-            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                Files.delete(dir);
-                return FileVisitResult.CONTINUE;
-            }
-        });
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                    Files.delete(dir);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            System.out.println("ERROR: Failed to recursively delete existing directory" + path);
+        }
     }
 
 

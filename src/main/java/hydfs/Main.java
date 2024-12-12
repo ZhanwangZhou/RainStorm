@@ -1,7 +1,5 @@
 package main.java.hydfs;
 
-import java.io.IOException;
-import java.security.NoSuchAlgorithmException;
 import java.util.Scanner;
 import java.util.concurrent.*;
 
@@ -12,7 +10,7 @@ Initialize a new node for HyDFS with TCP/UDP monitor and failure detection.
 Read in command line inputs and send requests to servers within HyDFS.
  */
 public class Main {
-    public static void main(String[] args) throws IOException, NoSuchAlgorithmException {
+    public static void main(String[] args) {
         // Start threads to listen to TCP/UDP messages
         Server server = new Server(args);
         Thread tcpListen = new Thread(server::tcpListen);
@@ -134,5 +132,6 @@ public class Main {
         tcpListen.interrupt();
         udpListen.interrupt();
         scheduler.shutdownNow();
+        System.exit(0);
     }
 }

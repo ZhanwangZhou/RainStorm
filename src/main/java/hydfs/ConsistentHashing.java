@@ -16,9 +16,14 @@ public class ConsistentHashing {
     private TreeMap<Long, Integer> ring;
     private MessageDigest md;
 
-    public ConsistentHashing() throws NoSuchAlgorithmException {
+    public ConsistentHashing() {
         this.ring = new TreeMap<>();
-        this.md = MessageDigest.getInstance("MD5");
+        try {
+            this.md = MessageDigest.getInstance("MD5");
+        } catch (NoSuchAlgorithmException e) {
+            System.out.println("ERROR: MD5 is not available");
+            System.exit(1);
+        }
     }
 
     public void addServer(int server) {

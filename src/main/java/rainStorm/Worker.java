@@ -9,8 +9,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.security.NoSuchAlgorithmException;
-import java.time.Clock;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,45 +19,52 @@ import java.util.logging.Logger;
 public class Worker {
 
     public Server server;
-    final int portTCP; // self node's  tcp port
-    private int leaderPortTCP;
-    private String leaderIpAddress;
-    private int leaderNodeId;
-    private HashMap<Integer, JSONObject> stream1;
-    final Queue<Integer> streamQueue1;
-    private HashMap<Integer, JSONObject> stream2;
-    final Queue<Integer> streamQueue2;
-    final ServerSocket tcpServerSocket;
+    public final int portTCP; // this worker's tcp port
 
-    private HashMap<String, String> stashedOutputs1; // new key -> new val
-    private HashMap<Integer, String> stashedIds1; // id -> new key
-    private HashMap<String, String> stashedOutputs2;
-    private HashMap<Integer, String> stashedIds2;
+    private int leaderPortTCP; // the leader's tcp port
+    private String leaderIpAddress; // the leader's IP address
 
+    private final HashMap<Integer, JSONObject> stream1; // hash map of stage-1 stream tuples
+    private final Queue<Integer> streamQueue1; // queue of stage-1 stream tuples to be executed
+    private final HashMap<Integer, JSONObject> stream2; // hash map of stage-2 stream tuples
+    private final Queue<Integer> streamQueue2; // queue of stage-2 stream tuples to be executed
+    private final HashMap<String, String> stashedOutputs1; // hash map storing stashed op1 output
+    private final HashMap<Integer, String> stashedIds1; // hash map mapping stream tuple to op1 output
+    private final HashMap<String, String> stashedOutputs2; // hash map storing stashed op2 output
+    private final HashMap<Integer, String> stashedIds2; // hash map mapping stream tuple to op2 output
 
-    private final Logger logger;
-    final Clock clock;
     private final Scanner scanner;
+    private final Logger logger;
 
-    public Worker(String[] args) throws IOException, NoSuchAlgorithmException {
+    private final Thread serverTcpListen;
+    private final Thread serverUdpListen;
+    private final Thread workerListen;
+    private final Thread workerExecuteStream1;
+    private final Thread workerExecuteStream2;
+    private final ScheduledExecutorService scheduler;
+
+
+    /**
+     * Worker class constructor.
+     * @param args Include Argument to initialize worker HyDFS server and worker's TCP port.
+     */
+    public Worker(String[] args) {
+        this.server = new Server(Arrays.copyOfRange(args, 0, 5));
         this.portTCP = Integer.parseInt(args[5]);
-        this.clock = Clock.systemDefaultZone();
+
         this.stream1 = new HashMap<>();
         this.streamQueue1 = new LinkedList<>();
         this.stream2 = new HashMap<>();
         this.streamQueue2 = new LinkedList<>();
-        this.logger = Logger.getLogger("Worker");
-        logger.setLevel(Level.WARNING);
-        this.scanner = new Scanner(System.in);
-        this.tcpServerSocket = new ServerSocket(this.portTCP);
-
         this.stashedOutputs1 = new HashMap<>();
         this.stashedIds1 = new HashMap<>();
         this.stashedOutputs2 = new HashMap<>();
         this.stashedIds2 = new HashMap<>();
 
-        // Start threads to listen to TCP/UDP messages
-        server = new Server(Arrays.copyOfRange(args, 0, 5));
+        this.scanner = new Scanner(System.in);
+        this.logger = Logger.getLogger("Worker");
+        logger.setLevel(Level.WARNING);
+
         // Initialize a directory to store rainStorm log files
         File directory = new File("rainStorm" + server.nodeId);
         if (Files.exists(Paths.get(directory.getAbsolutePath()))) {
@@ -67,26 +72,50 @@ public class Worker {
         }
         boolean created = directory.mkdir();
         if(created) {
-            logger.info("HyDFS directory created");
+            logger.info("RainStorm directory created");
         }else{
-            logger.info("Failed to create HyDFS directory");
+            logger.info("Failed to create RainStorm directory");
         }
 
-        Thread serverTcpListen = new Thread(server::tcpListen);
+        // Start threads to listen to TCP/UDP messages
+        serverTcpListen = new Thread(server::tcpListen);
         serverTcpListen.start();
-        Thread serverUdpListen = new Thread(server::udpListen);
+        serverUdpListen = new Thread(server::udpListen);
         serverUdpListen.start();
-        Thread workerListen = new Thread(this::tcpListen);
+        workerListen = new Thread(this::tcpListen);
         workerListen.start();
-        Thread workerExecuteStream1 = new Thread(this::executeStream1);
+        workerExecuteStream1 = new Thread(this::processStream1);
         workerExecuteStream1.start();
-        Thread workerExecuteStream2 = new Thread(this::executeStream2);
+        workerExecuteStream2 = new Thread(this::processStream2);
         workerExecuteStream2.start();
+
         // Start threads to periodically ping and check for failure detection
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
+        scheduler = Executors.newScheduledThreadPool(3);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(server::checkPing, 1, 1, TimeUnit.SECONDS);
+    }
 
+
+    /**
+     * Worker main function
+     * @param args Include Argument to initialize worker HyDFS server and worker's TCP port.
+     */
+    public static void main(String[] args) {
+        if(args.length != 6) {
+            System.out.println("Usage: java Worker <Node ID> <IP Address> <HyDFS TCP Port> "
+                    + "<HyDFS UDP Port> <HyDFS Cache Size> <Worker TCP Port>");
+            return;
+        }
+        Worker worker = new Worker(args);
+        System.out.println("Succeed to launch worker");
+        worker.readCommand();
+    }
+
+
+    /**
+     * Continuously read command line user inputs.
+     */
+    public void readCommand() {
         while(server.running){
             System.out.println("Enter command for Worker:");
             String[] command = scanner.nextLine().split(" ");
@@ -94,17 +123,18 @@ public class Worker {
                 case "join":
                     if (command.length == 3) {
                         leaderIpAddress = command[1].split(":")[0];
-                        int port = Integer.parseInt(command[1].split(":")[1]);
+                        int leaderHyDFSPortTCP = Integer.parseInt(command[1].split(":")[1]);
                         leaderPortTCP = Integer.parseInt(command[2]);
-                        server.join(leaderIpAddress, port);
+                        server.join(leaderIpAddress, leaderHyDFSPortTCP);
                         JSONObject JoinMessage = new JSONObject();
                         JoinMessage.put("type", "WorkerJoin");
                         JoinMessage.put("id", server.nodeId);
                         JoinMessage.put("portTCP", this.portTCP);
-                        sendTCP(leaderIpAddress, leaderPortTCP, JoinMessage);
+                        server.sendTCP(leaderIpAddress, leaderPortTCP, JoinMessage);
                     } else {
                         System.out.println("Please specify the command as:");
-                        System.out.println("join <Leader Server IP Address>:<Leader Server Port> <Leader Port>");
+                        System.out.println("join <Leader HyDFS IP Address>:<Leader HyDFS TCP Port> "
+                                + "<Leader TCP Port>");
                     }
                     break;
                 case "create":
@@ -116,30 +146,22 @@ public class Worker {
                     }
                     break;
                 case "queue":
-                    System.out.println(streamQueue1);
-                    System.out.println(streamQueue2);
+                    System.out.println("Stream Queue for Op1: " + streamQueue1);
+                    System.out.println("Stream Queue for Op2: " + streamQueue2);
                     break;
                 case "quit":
-                    serverTcpListen.interrupt();
-                    serverUdpListen.interrupt();
-                    workerListen.interrupt();
-                    break;
+                    quit();
             }
         }
     }
 
-    public static void main(String[] args) throws IOException, NoSuchAlgorithmException {
-        if(args.length != 6) {
-            System.out.println("Please specify the command as:");
-            System.out.println("Worker <node_id> <ip_address> <hydfs_tcp_port> <hydfs_udp_port> " +
-                    "<hydfs_cache_size> <worker_tcp_port>");
-            return;
-        }
-        Worker worker = new Worker(args);
-    }
 
+    /**
+     * Worker TCP listen.
+     * Assign different types of incoming messages to their corresponding handle functions.
+     */
     private void tcpListen() {
-        try{
+        try (ServerSocket tcpServerSocket = new ServerSocket(portTCP)) {
             while(server.running){
                 Socket tcpSocket = tcpServerSocket.accept();
                 tcpSocket.setSoTimeout(5000);
@@ -150,7 +172,6 @@ public class Worker {
                 if (jsonString == null) continue;
                 JSONObject receivedMessage = new JSONObject(jsonString);
                 String messageType = receivedMessage.getString("type");
-                // System.out.println(receivedMessage);
                 switch (messageType) {
                     case "Stream":
                         handleStream(receivedMessage);
@@ -159,8 +180,10 @@ public class Worker {
                         handleWorkerJoinAck(receivedMessage);
                         break;
                     case "Complete":
-                        handleComplete(receivedMessage);
+                        handleComplete();
                         break;
+                    case "Quit":
+                        quit();
                 }
             }
         }catch(IOException e){
@@ -168,78 +191,29 @@ public class Worker {
         }
     }
 
-    private List<String> executeStateful(int id, JSONObject info, int stage) {
-        String key = info.getString("key");
-        String value = info.getString("value");
-        String op = info.getString("op");
-        String destFile = info.getString("destFile");
-        if (!server.fileBlockMap.containsKey(destFile)) {
-            server.createEmptyFile(destFile);
-        }
-        String currentState = "";
 
-        if (stage == 1 && stashedOutputs1.containsKey(key)) {
-            currentState = stashedOutputs1.get(key);
-        } else if (stage == 2 && stashedOutputs2.containsKey(key)){
-            currentState = stashedOutputs2.get(key);
-        } else {
-            String localFilename = "rainStorm" + server.nodeId + "/" + destFile;
-            server.getFile(destFile, localFilename);
-            try(BufferedReader reader = new BufferedReader(new FileReader(localFilename))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    int index1 = line.indexOf("<Key>=");
-                    int index2 = line.indexOf("<Value>=");
-                    String keyInLine = line.substring(index1 + 6, index2);
-                    if (keyInLine.equals(key)) {
-                        currentState = line.substring(index2 + 8);
-                    }
-                }
-                Files.deleteIfExists(Paths.get(localFilename));
-            } catch (IOException e) {
-                System.out.println(localFilename);
-                logger.warning("Failed to read log file " + e.getMessage());
-            }
-        }
-        // key = key.indexOf(' ') == -1? key : "'" + key + "'";
-        // value = value.indexOf(' ') == -1? value : "'" + value + "'";
-        // currentState = currentState.indexOf(' ') == -1? currentState : "'" + currentState + "'";
-        String[] cli = {op, key, value, currentState};
-        return execute(cli);
-    }
-
-    private List<String> executeStateless(int id, JSONObject info) {
-        String key = info.getString("key");
-        String value = info.getString("value");
-        String op = info.getString("op");
-        String destFile = info.getString("destFile");
-        if (!server.fileBlockMap.containsKey(destFile)) {
-            server.createEmptyFile(destFile);
-        }
-        // key = key.indexOf(' ') == -1? key : "'" + key + "'";
-        // value = value.indexOf(' ') == -1? value : "'" + value + "'";
-        String[] cli = {op, key, value};
-        return execute(cli);
-    }
-
-    private void executeStream1() {
+    /**
+     * Continuously process assigned stream tuples in streamQueue1.
+     * Append to stashedOutputs1 if outputs are returned after processing.
+     * Otherwise, immediately send acknowledgement to leader.
+     */
+    public void processStream1() {
         while (server.running) {
-            if (streamQueue1.isEmpty() || stashedIds1.size() >= 20) {
+            if (streamQueue1.isEmpty() || stashedIds1.size() >= 50) {
                 ackStashedChanges(1);
             } else {
                 List<String> outputs;
                 int id = streamQueue1.poll();
-                JSONObject partition = stream1.get(id);
-                if (partition.getBoolean("stateful")) {
-                    outputs = executeStateful(id, stream1.get(id), 1);
+                if (stream1.get(id).getBoolean("stateful")) {
+                    outputs = processStateful(stream1.get(id), 1);
                 } else {
-                    outputs = executeStateless(id, stream1.get(id));
+                    outputs = processStateless(stream1.get(id));
                 }
                 if(outputs.isEmpty()) {
                     JSONObject ackMessage = new JSONObject();
                     ackMessage.put("type", "Stream1EmptyAck");
                     ackMessage.put("id", id);
-                    sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
+                    server.sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
                 } else if (outputs.size() == 2) {
                     String key = outputs.get(0);
                     String value = outputs.get(1);
@@ -257,24 +231,29 @@ public class Worker {
         }
     }
 
-    private void executeStream2() {
+
+    /**
+     * Continuously process assigned stream tuples in streamQueue2.
+     * Append to stashedOutputs2 if outputs are returned after processing.
+     * Otherwise, immediately send acknowledgement to leader.
+     */
+    public void processStream2() {
         while (server.running) {
-            if (streamQueue2.isEmpty() || stashedIds2.size() >= 20) {
+            if (streamQueue2.isEmpty() || stashedIds2.size() >= 50) {
                 ackStashedChanges(2);
             } else {
                 List<String> outputs;
                 int id = streamQueue2.poll();
-                JSONObject partition = stream2.get(id);
-                if (partition.getBoolean("stateful")) {
-                    outputs = executeStateful(id, stream2.get(id), 2);
+                if (stream2.get(id).getBoolean("stateful")) {
+                    outputs = processStateful(stream2.get(id), 2);
                 } else {
-                    outputs = executeStateless(id, stream2.get(id));
+                    outputs = processStateless(stream2.get(id));
                 }
                 if (outputs.isEmpty()) {
                     JSONObject ackMessage = new JSONObject();
                     ackMessage.put("type", "Stream2EmptyAck");
                     ackMessage.put("id", id);
-                    sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
+                    server.sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
                 } else if (outputs.size() == 2) {
                     String key = outputs.get(0);
                     String value = outputs.get(1);
@@ -292,59 +271,25 @@ public class Worker {
         }
     }
 
-    private void ackStashedChanges(int stage) {
-        HashMap<String, String> updates = new HashMap<>();
-        List<JSONObject> ackMessages = new ArrayList<>();
-        if (stage == 1) {
-            for (int id: stashedIds1.keySet()) {
-                String key = stashedIds1.get(id);
-                String value = stashedOutputs1.get(key);
-                String destFile = stream1.get(id).getString("destFile");
-                if(!updates.containsKey(destFile)) updates.put(destFile, "");
-                updates.put(destFile, updates.get(destFile) + "<Key>=" + key + "<Value>=" + value + "\n");
-                JSONObject ackMessage = new JSONObject();
-                ackMessage.put("type", "Stream1Ack");
-                ackMessage.put("id", id);
-                ackMessage.put("key", key);
-                ackMessage.put("value", value);
-                ackMessages.add(ackMessage);
-            }
-            for (String destFile: updates.keySet()) {
-                server.appendString(updates.get(destFile), destFile);
-            }
-            for (JSONObject ackMessage: ackMessages) {
-                sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
-            }
-            stashedOutputs1.clear();
-            stashedIds1.clear();
-        } else if (stage == 2) {
-            for (int id: stashedIds2.keySet()) {
-                String key = stashedIds2.get(id);
-                String value = stashedOutputs2.get(key);
-                String destFile = stream2.get(id).getString("destFile");
-                if(!updates.containsKey(destFile)) updates.put(destFile, "");
-                updates.put(destFile, updates.get(destFile) + "<Key>=" + key + "<Value>=" + value + "\n");
-                JSONObject ackMessage = new JSONObject();
-                ackMessage.put("type", "Stream2Ack");
-                ackMessage.put("id", id);
-                ackMessage.put("key", key);
-                ackMessage.put("value", value);
-                ackMessages.add(ackMessage);
-            }
-            for (String destFile: updates.keySet()) {
-                server.appendString(updates.get(destFile), destFile);
-            }
-            for (JSONObject ackMessage: ackMessages) {
-                sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
-            }
-            stashedOutputs2.clear();
-            stashedIds2.clear();
-        }
-    }
 
     /**
-     * Handles the new partition/work assigned from leader to this worker
-     * Store the partition in the map and adds it to the processing Queue
+     * Kill all threads and exit the program of the current worker
+     */
+    public void quit() {
+        serverTcpListen.interrupt();
+        serverUdpListen.interrupt();
+        workerListen.interrupt();
+        workerExecuteStream1.interrupt();
+        workerExecuteStream2.interrupt();
+        scheduler.shutdownNow();
+        System.exit(0);
+    }
+
+
+    /**
+     * Handle "Stream" message.
+     * Store the stream tuple in the map and adds it to the processing Queue.
+     * @param message Message received at the worker's TCP port.
      */
     private void handleStream(JSONObject message) {
         int partitionId = message.getInt("id");
@@ -369,17 +314,22 @@ public class Worker {
         }
     }
 
+
     /**
-     * Handles Join Acknowledgment from Leader
-     * Logs a success message upon receiving the acknowledgment
+     * Handle "WorkerJoinAck" message.
+     * @param message Message received at the worker's TCP port.
      */
     private void handleWorkerJoinAck(JSONObject message) {
         this.leaderPortTCP = message.getInt("leaderPortTCP");
         logger.info("Join acknowledgment received for leader ");
-        System.out.println("Successfully joined Leader as Worker");
     }
 
-    private void handleComplete(JSONObject message) {
+
+    /**
+     * Handle "Complete" message.
+     * Reset class variables.
+     */
+    private void handleComplete() {
         stream1.clear();
         stashedIds1.clear();
         stashedOutputs1.clear();
@@ -392,7 +342,103 @@ public class Worker {
         System.out.println("Complete all streams");
     }
 
-    private List<String> execute(String[] args) {
+
+    /**
+     * Process the stream tuple by running the stateful operation.
+     * Fetch current state from stashedOutputs or HyDFS logs.
+     * @param info JSONObject of the stream tuple.
+     * @param stage The stage of operation to execute.
+     * @return Outputs of the operation execution on the stream tuple
+     */
+    private List<String> processStateful(JSONObject info, int stage) {
+        String key = info.getString("key");
+        String value = info.getString("value");
+        String op = info.getString("op");
+        String destFile = info.getString("destFile");
+        if (!server.hasFile(destFile)) { server.createEmptyFile(destFile); }
+        String currentState = "";
+        if (stage == 1 && stashedOutputs1.containsKey(key)) {
+            currentState = stashedOutputs1.get(key);
+        } else if (stage == 2 && stashedOutputs2.containsKey(key)){
+            currentState = stashedOutputs2.get(key);
+        } else {
+            String localFilename = "rainStorm" + server.nodeId + "/" + destFile;
+            server.getFile(destFile, localFilename);
+            try(BufferedReader reader = new BufferedReader(new FileReader(localFilename))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    int index1 = line.indexOf("<Key>=");
+                    int index2 = line.indexOf("<Value>=");
+                    String keyInLine = line.substring(index1 + 6, index2);
+                    if (keyInLine.equals(key)) {
+                        currentState = line.substring(index2 + 8);
+                    }
+                }
+                Files.deleteIfExists(Paths.get(localFilename));
+            } catch (IOException e) {
+                System.out.println(localFilename);
+                logger.warning("Failed to read log file " + e.getMessage());
+            }
+        }
+        String[] cli = {op, key, value, currentState};
+        return executeOperation(cli);
+    }
+
+
+    /**
+     * Process the stream tuple by running the stateless operation.
+     * @param info JSONObject of the stream tuple.
+     * @return Outputs of the operation execution on the stream tuple
+     */
+    private List<String> processStateless(JSONObject info) {
+        String destFile = info.getString("destFile");
+        if (!server.hasFile(destFile)) { server.createEmptyFile(destFile); }
+        String[] cli = {info.getString("op"), info.getString("key"), info.getString("value")};
+        return executeOperation(cli);
+    }
+
+
+    /**
+     * Acknowledge all stashed outputs of the processed stream tuples.
+     * Update all outputs to HyDFS destination file.
+     * @param stage Stage of the operation executed on the stream tuple.
+     */
+    private void ackStashedChanges(int stage) {
+        HashMap<String, String> updates = new HashMap<>();
+        List<JSONObject> ackMessages = new ArrayList<>();
+        HashMap<Integer, String> stashedIds = stage == 1? stashedIds1 : stashedIds2;
+        HashMap<String, String> stashedOutputs = stage == 1? stashedOutputs1 : stashedOutputs2;
+        HashMap<Integer, JSONObject> stream = stage == 1? stream1 : stream2;
+        for (int id: stashedIds.keySet()) {
+            String key = stashedIds.get(id);
+            String value = stashedOutputs.get(key);
+            String destFile = stream.get(id).getString("destFile");
+            if(!updates.containsKey(destFile)) updates.put(destFile, "");
+            updates.put(destFile, updates.get(destFile) + "<Key>=" + key + "<Value>=" + value + "\n");
+            JSONObject ackMessage = new JSONObject();
+            if (stage == 1) ackMessage.put("type", "Stream1Ack");
+            if (stage == 2) ackMessage.put("type", "Stream2Ack");
+            ackMessage.put("id", id);
+            ackMessage.put("key", key);
+            ackMessage.put("value", value);
+            ackMessages.add(ackMessage);
+        }
+        for (String destFile: updates.keySet()) {
+            server.appendString(updates.get(destFile), destFile);
+        }
+        for (JSONObject ackMessage: ackMessages) {
+            server.sendTCP(leaderIpAddress, leaderPortTCP, ackMessage);
+        }
+        stashedIds.clear();
+    }
+
+
+    /**
+     * Call the operation command and read the output.
+     * @param args Argument required to execute the operation.
+     * @return List of Strings containing the key and value.
+     */
+    private List<String> executeOperation(String[] args) {
         List<String> outputs = new ArrayList<>();
         try{
             Runtime rt = Runtime.getRuntime();
@@ -409,39 +455,18 @@ public class Worker {
                     InputStreamReader(proc.getInputStream()));
             BufferedReader stdError = new BufferedReader(new
                     InputStreamReader(proc.getErrorStream()));
-
-            // Read the output from the command
-            String temp;
-            while ((temp = stdInput.readLine()) != null) {
-                outputs.add(temp);
+            String line;
+            while ((line = stdInput.readLine()) != null) {
+                outputs.add(line);
             }
-            // Read any errors from the attempted command
-            while ((temp = stdError.readLine()) != null) {
-                logger.warning("Error while executing command" + Arrays.toString(args) + ": " + temp);
+            while ((line = stdError.readLine()) != null) {
+                logger.warning("Error while executing command" + Arrays.toString(args) + ": " + line);
             }
-
         }catch (IOException e) {
-            logger.warning("Cannot read from command output of " + Arrays.toString(args) + "\n" + e.getMessage());
+            logger.warning("Cannot read from command output of " + Arrays.toString(args));
         }
         return outputs;
     }
 
-    /*
-     Common method used to send a message through TCP to the specified node.
-     */
-    private void sendTCP(String receiverIp, int receiverPort, JSONObject message){
-        try (Socket socket = new Socket(receiverIp, receiverPort)) {
-            socket.setSoTimeout(5000);
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-            writer.write(message.toString());
-            writer.newLine();
-            writer.flush();
-            logger.info("Send " + message.getString("type") + " message to"
-                    + receiverIp + ":" + receiverPort);
-        } catch (IOException e) {
-            logger.warning("Failed to send " + message.getString("type") + " message to "
-                    + receiverIp + ":" + receiverPort);
-        }
-    }
 }
 

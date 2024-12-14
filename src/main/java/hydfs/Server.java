@@ -14,36 +14,38 @@ import java.util.logging.Logger;
 
 
 public class Server {
-    public final int nodeId; // self node id
-    final String ipAddress; // self node's ip address
-    final int portTCP; // self node's  tcp port
-    final int portUDP; // self node's udp port
 
+    public final int nodeId; // self node id
+    public final String ipAddress; // self node's ip address
+    public int portTCP; // self node's  tcp port
+    public int portUDP; // self node's udp port
     public Boolean running; //  if self node is running
-    public Boolean locked; // if self node is processing a command
+
+    private Boolean locked; // if self node is processing a command
     private Boolean failureDetectionMode; // suspicion mode flag: false = heartbeat and true = PingAck+S
 
-    public final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
-    final LRUCache lruCache; // LRU cache storing recently read files
-    final Set<String> localFiles; // set of HyDFS files on this server
-    public final Map<String, Integer> fileBlockMap; // map storing number of blocks of each HyDFS file
-    public final HashMap<Integer, Node> membership; // membership of all nodes with node id as keys
+    private final ConsistentHashing ch; // Consistent Hashing object used to hash servers and files
+    private final LRUCache lruCache; // LRU cache storing recently read files
+    private final Set<String> localFiles; // set of HyDFS files on this server
+    private final Map<String, Integer> fileBlockMap; // map storing number of blocks of each HyDFS file
+    private final HashMap<Integer, Node> membership; // membership of all nodes with node id as keys
     private long predecessorLastPingTime; // time of last ping received from the predecessor
     private int predecessorLastPingId; //  id of last pinging predecessor
     private long successorLastPingTime; // time of last ping received from the successor
     private int successorLastPingId; // id of the last pinging successor
-    final Map<Integer, Long> lastPingTimes; // each node's time of last ping
-    final Map<Integer, Integer> incarnationNumbers; // each node's local incarnation number
-    final Map<String, Set<Integer>> unreceivedBlocks; // unreceived block during get and merge
-    final Map<String, Boolean> unreceivedBlockLocks;
+    private final Map<Integer, Long> lastPingTimes; // each node's time of last ping
+    private final Map<Integer, Integer> incarnationNumbers; // each node's local incarnation number
+    private final Map<String, Set<Integer>> unreceivedBlocks; // unreceived block during get and merge
+    private final Map<String, Boolean> unreceivedBlockLocks; // lock for each set in unreceivedBlock
     private Thread tempThread = null;
 
-    final Logger logger;
-    final Clock clock;
+    private final Logger logger;
+    private final Clock clock;
 
 
-    /*
-    Server class constructor
+    /**
+     * Server class constructor
+     * @param args Array of String with server node ID, IP address, TCP port, UDP port, and cache size
      */
     public Server(String[] args) {
         this.nodeId = Integer.parseInt(args[0]);
@@ -51,8 +53,8 @@ public class Server {
         this.portTCP = Integer.parseInt(args[2]);
         this.portUDP = Integer.parseInt(args[3]);
         this.lruCache = new LRUCache(Integer.parseInt(args[4]));
-
         this.running = true;
+
         this.locked = false;
         this.failureDetectionMode = false;
 
@@ -101,9 +103,122 @@ public class Server {
     }
 
 
-    /*
-    Server-side TCP listen.
-    Assign different types of incoming messages to their corresponding handle functions
+    public HashMap<Integer, Node> getMembership() { return membership; }
+
+
+    public Node getMember(int nodeId) { return membership.get(nodeId); }
+
+
+    public boolean hasFile(String hydfsFilename) {
+        return fileBlockMap.containsKey(hydfsFilename);
+    }
+
+
+    /**
+     * Common method used to send a message through TCP to the specified node.
+     * @param receiverIp The receiver's IP address.
+     * @param receiverPort The receiver's TCP port.
+     * @param message The message to be sent.
+     */
+    public void sendTCP(String receiverIp, int receiverPort, JSONObject message){
+        try (Socket socket = new Socket(receiverIp, receiverPort)) {
+            socket.setSoTimeout(10000);
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
+            writer.write(message.toString());
+            writer.newLine();
+            writer.flush();
+            logger.info("Send " + message.getString("type") + " message to"
+                    + receiverIp + ":" + receiverPort);
+        } catch (IOException e) {
+            logger.warning("Failed to send " + message.getString("type") + " message to "
+                    + receiverIp + ":" + receiverPort + e.getMessage());
+        }
+    }
+
+
+    /**
+     * Common method used to send a message through UDP to the specified node.
+     * @param receiverIp The receiver's IP address.
+     * @param receiverPort The receiver's UDP port.
+     * @param message The message to be sent.
+     */
+    public void sendUDP(String receiverIp, int receiverPort, JSONObject message) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(baos);
+            oos.writeObject(message.toString());
+            byte[] buffer = baos.toByteArray();
+            InetAddress address = InetAddress.getByName(receiverIp);
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, receiverPort);
+            socket.send(packet);
+        } catch (IOException e) {
+            logger.warning("Failed to send " + message.getString("type") + " message to "
+                    + receiverIp + ":" + receiverPort);
+        }
+    }
+
+
+    /**
+     * Common method to initiate gossip dissemination to all nodes potentially alive.
+     * @param message The message to be sent
+     * @param isTCP true if sending through TCP; false if sending through UDP.
+     */
+    public void gossip(JSONObject message, boolean isTCP) {
+        // Check and add the gossip count
+        int gossipCount = message.getInt("gossipCount");
+        if(gossipCount > 2) return;
+        message.put("gossipCount", gossipCount + 1);
+        // Check current available members
+        List<Node> availableMembers = new ArrayList<>();
+        for (Node member : membership.values()) {
+            if (member.getStatus().equals("alive") ||
+                    failureDetectionMode && member.getStatus().equals("suspect")) {
+                availableMembers.add(member);
+            }
+        }
+        int availableNumber = Math.min(availableMembers.size(), (availableMembers.size() / 3 + 2));
+        if (availableNumber < 1) {
+            logger.warning("No other member to disseminate message");
+            return;
+        }
+        // Send gossip message to random available numbers
+        Collections.shuffle(availableMembers, new Random());
+        List<Node> selectedMembers = availableMembers.subList(0, availableNumber);
+        for(Node member: selectedMembers) {
+            if (isTCP) sendTCP(member.getIpAddress(), member.getPortTCP(), message);
+            else sendUDP(member.getIpAddress(), member.getPortUDP(), message);
+        }
+    }
+
+
+    /**
+     * Helper function to recursively delete directories.
+     * @param path Path to be deleted recursively.
+     */
+    public void deleteDirectoryRecursively(Path path) {
+        try {
+            Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                    Files.delete(dir);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            System.out.println("ERROR: Failed to recursively delete existing directory" + path);
+        }
+    }
+
+
+    /**
+     * Server-side TCP listen.
+     * Assign different types of incoming messages to their corresponding handle functions.
      */
     public void tcpListen() {
         logger.info("Start TCP Listen");
@@ -118,7 +233,6 @@ public class Server {
                 if (jsonString == null) continue;
                 JSONObject receivedMessage = new JSONObject(jsonString);
                 String messageType = receivedMessage.getString("type");
-                // System.out.println(receivedMessage);
                 switch(messageType) {
                     case "Join":
                         handleJoin(receivedMessage);
@@ -187,9 +301,9 @@ public class Server {
     }
 
 
-    /*
-    Server-side UDP listen.
-    Assign different types of incoming messages to their corresponding handle functions
+    /**
+     * Server-side UDP listen.
+     * Assign different types of incoming messages to their corresponding handle functions.
      */
     public void udpListen(){
         logger.info("Start UDP Listen");
@@ -226,10 +340,10 @@ public class Server {
     }
 
 
-    /*
-    Periodical ping for failure detection.
-    Regular mode: send heartbeats to predecessor and successor
-    Suspicion mode: ping a random node and wait for ack
+    /**
+     * Periodical ping for failure detection.
+     * Regular mode: send heartbeats to predecessor and successor.
+     * Suspicion mode: ping a random node and wait for ack.
      */
     public void ping(){
         if (!running) return;
@@ -258,10 +372,10 @@ public class Server {
     }
 
 
-    /*
-    Periodical ping check for failure detection.
-    Regular mode: check heartbeats from predecessor and successor
-    Suspicion mode: check ack from pinged nodes
+    /**
+     * Periodical ping check for failure detection.
+     * Regular mode: check heartbeats from predecessor and successor.
+     * Suspicion mode: check ack from pinged nodes.
      */
     public void checkPing() {
         if(!running) return;
@@ -308,8 +422,10 @@ public class Server {
     }
 
 
-    /*
-    Send "Join" request to the introducer to join the network
+    /**
+     * Send "Join" request to the introducer to join the network.
+     * @param introIpAddress IP address of the introducer.
+     * @param introPort TCP port of the introducer.
      */
     public void join(String introIpAddress, int introPort){
         running = true;
@@ -326,8 +442,8 @@ public class Server {
     }
 
 
-    /*
-    Disseminate "Leave" message and temporarily leave the network
+    /**
+     * Disseminate "Leave" message and temporarily leave the network
      */
     public void leave() {
         membership.get(nodeId).setStatus("leave");
@@ -341,9 +457,11 @@ public class Server {
     }
 
 
-    /*
-    Send "CreateFile" request to destination nodes to add a local file as a new HyDFS file
-    Disseminate "UpdateFile" message to inform all nodes of the file update
+    /**
+     * Send "CreateFile" request to destination nodes to add a local file as a new HyDFS file.
+     * Disseminate "UpdateFile" message to inform all nodes of the file update.
+     * @param localFilename Filepath of the local source file.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
      */
     public void createFile(String localFilename, String hydfsFilename) {
         lock("createFile");
@@ -362,7 +480,7 @@ public class Server {
             byte[] fileContent = Files.readAllBytes(Paths.get(localFilename));
             createFileMessage.put("blockData", Base64.getEncoder().encodeToString(fileContent));
         } catch (IOException e) {
-            logger.warning("Failed to read from the local file" + localFilename + e.getMessage());
+            logger.warning("Failed to read from local file " + localFilename + e.getMessage());
             locked = false;
             return;
         }
@@ -375,6 +493,12 @@ public class Server {
         logger.info("Sent local file " + localFilename + " for HyDFS file creation.");
     }
 
+
+    /**
+     * Send "CreateFile" request to destination nodes to add a new empty HyDFS file.
+     * Disseminate "UpdateFile" message to inform all nodes of the file update.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
+     */
     public void createEmptyFile(String hydfsFilename) {
         lock("createEmptyFile");
         if(fileBlockMap.containsKey(hydfsFilename)){
@@ -399,10 +523,12 @@ public class Server {
     }
 
 
-    /*
-    Send "GetFile" request to nodes for their file blocks.
-    Concatenate all file blocks and add the concatenated file to cache.
-    Copy the cache file to specified local file path.
+    /**
+     * Send "GetFile" request to nodes for their file blocks.
+     * Concatenate all file blocks and add the concatenated file to cache.
+     * Copy the cache file to specified local file path.
+     * @param hydfsFilename Filename of the source file on HyDFS.
+     * @param localFilename Filepath of the local destination file.
      */
     public void getFile(String hydfsFilename, String localFilename) {
         lock("getFile");
@@ -414,12 +540,14 @@ public class Server {
         }
         String cacheFilename = "Cache" + nodeId + "/" + hydfsFilename;
         Path cacheFilePath = Paths.get(cacheFilename);
+
         // If the file is not inside cache, get the file from HyDFS and add it to cache
         if(fileBlockMap.get(hydfsFilename) != lruCache.get(hydfsFilename)){
             int blockNum = fileBlockMap.get(hydfsFilename);
             unreceivedBlocks.put(hydfsFilename, new HashSet<>());
             unreceivedBlockLocks.put(hydfsFilename, false);
             for(int i = 1; i <= blockNum; ++i) unreceivedBlocks.get(hydfsFilename).add(i);
+
             // Keep sending "GetFile" request until all blocks are received
             int secondsPassed = 0;
             while(!unreceivedBlocks.get(hydfsFilename).isEmpty()){
@@ -450,6 +578,7 @@ public class Server {
                 }
             }
             logger.info("Received all file blocks for " + hydfsFilename);
+
             // Delete outdated cache file of the HyDFS file to be read
             try {
                 Files.deleteIfExists(cacheFilePath);
@@ -459,6 +588,7 @@ public class Server {
                 return;
             }
             logger.info("Delete outdated cache file of " + hydfsFilename);
+
             // Append all block contents to the cached file
             List<String> blockFiles = new ArrayList<>();
             for(int i = 1; i <= blockNum; ++i){
@@ -474,6 +604,7 @@ public class Server {
                 logger.warning("Failed to write cache file " + cacheFilename);
             }
             logger.info("Appended all blocks to cache file of " + hydfsFilename);
+
             // Delete LRU cache file
             String deletedFilename = lruCache.put(hydfsFilename, fileBlockMap.get(hydfsFilename));
             try {
@@ -484,6 +615,7 @@ public class Server {
                 logger.warning("Failed to delete LRU cache file");
             }
         }
+
         // Copy cached file to the specified local file path
         try {
         Files.copy(cacheFilePath, Paths.get(localFilename), StandardCopyOption.REPLACE_EXISTING);
@@ -495,10 +627,13 @@ public class Server {
     }
 
 
-    /*
-    Send "GetFromReplica" request to get the first block of a HyDFS file from specified node.
-    The target node should be specified with its <IP Address>:<TCP Port>.
-    Mainly for debug purpose.
+    /**
+     * Send "GetFromReplica" request to get the first block of a HyDFS file from specified node.
+     * The target node should be specified with its <IP Address>:<TCP Port>.
+     * Mainly for debug purpose.
+     * @param targetAddressPort IP address and TCP port of the server to get replica from.
+     * @param hydfsFilename Filename of the source file on HyDFS.
+     * @param localFilename Filepath of the local destination file.
      */
     public void getFromReplica(String targetAddressPort, String hydfsFilename, String localFilename) {
         String[] addressParts = targetAddressPort.split(":");
@@ -514,8 +649,10 @@ public class Server {
     }
 
 
-    /*
-    Send "AppendFile" request to file block 1 owner to append local file content to a HyDFS file
+    /**
+     * Send "AppendFile" request to file block 1 owner to append local file content to a HyDFS file.
+     * @param localFilename Filepath of the local source file.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
      */
     public void appendFile(String localFilename, String hydfsFilename) {
         if(!fileBlockMap.containsKey(hydfsFilename)) {
@@ -538,41 +675,34 @@ public class Server {
 
     }
 
-    /*
-     * Append a String as a new block into a file
-     * Content: new string to append
-     * hydfsFilename: target hydfs filename
+
+    /**
+     * Send "AppendFile" request to file block 1 owner to append a String to a HyDFS file.
+     * @param content The String to be appended.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
      */
     public void appendString(String content, String hydfsFilename) {
         if (!fileBlockMap.containsKey(hydfsFilename)) {
             System.out.println("The file to be appended does not exist in HyDFS.");
             return;
         }
-
-        // Determine the block num to append the content
-        int currentBlockNum = fileBlockMap.get(hydfsFilename);
-        int newBlockNum = currentBlockNum + 1;  // New block ID
-
-        // Prepare the append message
+        int blockId = fileBlockMap.get(hydfsFilename) + 1;
+        Node receiver = membership.get(ch.getServer("1_" + hydfsFilename));
         JSONObject appendFileMessage = new JSONObject();
         appendFileMessage.put("type", "AppendFile");
         appendFileMessage.put("hydfsFilename", hydfsFilename);
-        appendFileMessage.put("blockId", newBlockNum);
+        appendFileMessage.put("blockId", blockId);
         appendFileMessage.put("blockData", Base64.getEncoder().encodeToString(content.getBytes()));
-
-        Node receiver = membership.get(ch.getServer("1_" + hydfsFilename));
-
-        try {
-            sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), appendFileMessage);
-            logger.info("String appended to HyDFS file " + hydfsFilename + ": " + content);
-        } catch (Exception e) {
-            logger.warning("Failed to append string to HyDFS file: " + e.getMessage());
-        }
+        sendTCP(receiver.getIpAddress(), receiver.getPortTCP(), appendFileMessage);
+        logger.info("String appended to HyDFS file " + hydfsFilename + ": " + content);
     }
 
 
-    /*
-    Append multiple local files to a HyDFS file from different nodes concurrently
+    /**
+     * Append multiple local files to a HyDFS file from different nodes concurrently.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
+     * @param nodeIds String of IDs of nodes to append from, separated by commas.
+     * @param localFilenames String of local source files to append, separated by commas.
      */
     public void appendMultiFiles(String hydfsFilename, String nodeIds, String localFilenames) {
         // Process params
@@ -608,9 +738,10 @@ public class Server {
     }
 
 
-    /*
-    Send "Merge" request to initiate merge process.
-    All blocks of the specified HyDFS file will be merged into one block.
+    /**
+     * Send "Merge" request to initiate merge process.
+     * All blocks of the specified HyDFS file will be merged into one block.
+     * @param hydfsFilename Filename of the HyDFS file to be merged.
      */
     public void mergeFile(String hydfsFilename) {
         if (!fileBlockMap.containsKey(hydfsFilename)) {
@@ -630,9 +761,12 @@ public class Server {
     }
 
 
-    /*
-    Initiates multi-append and merge operations on a specified file.
-    For test purpose only.
+    /**
+     * Initiates multi-append and merge operations on a specified file.
+     * For test purpose only.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
+     * @param nodeIds String of IDs of nodes to append from, separated by commas.
+     * @param localFilenames String of local source files to append, separated by commas.
      */
     public void appendMultiFilesAndMerge(String hydfsFilename, String nodeIds, String localFilenames) {
         appendMultiFiles(hydfsFilename, nodeIds, localFilenames);
@@ -645,8 +779,8 @@ public class Server {
     }
 
 
-    /*
-    List all HyDFS files and their blocks stored on this server
+    /**
+     * List all HyDFS files and their blocks stored on this server.
      */
     public void listSelfStorage() {
         System.out.println("Node Id = " + this.nodeId + "; Ring ID = " + ch.getRingId(this.nodeId));
@@ -659,10 +793,15 @@ public class Server {
     }
 
 
-    /*
-    List all blocks of the specified HyDFS file and their locations
+    /**
+     * List all blocks of the specified HyDFS file and their locations.
+     * @param filename Filename of the HyDFS file to be listed.
      */
     public void listFileLocation(String filename) {
+        if (!fileBlockMap.containsKey(filename)) {
+            System.out.println("File does not exist in HyDFS");
+            return;
+        }
         System.out.println("File " + filename + " has " + fileBlockMap.get(filename) + " blocks.");
         for(int i = 1; i <= fileBlockMap.get(filename); ++i) {
             String blockName = i + "_" + filename;
@@ -682,17 +821,22 @@ public class Server {
     }
 
 
-    /*
-    Print self node ID.
+    /**
+     * Print self node ID, IP address, TCP port, and UDP port.
      */
     public void listSelf() {
-        System.out.println("NodeId = " + nodeId);
+        System.out.println(
+                "NodeId = " + nodeId
+                + "IP Address = " + ipAddress
+                + "Port TCP = " + portTCP
+                + "Port UDP = " + portUDP
+        );
     }
 
 
-    /*
-    List current membership.
-    List each node's ID, IP address, and status.
+    /**
+     * List current membership.
+     * List each node's ID, IP address, and status.
      */
     public void listMem() {
         System.out.println("Current Membership List");
@@ -706,9 +850,9 @@ public class Server {
     }
 
 
-    /*
-    List current membership.
-    List each node's ID, IP address, status, and ring ID.
+    /**
+     * List current membership.
+     * List each node's ID, IP address, status, and ring ID.
      */
     public void listMemRingIds() {
         System.out.println("Current Membership List and Ring IDs:");
@@ -723,17 +867,18 @@ public class Server {
     }
 
 
-    /*
-    Print current server mode.
+    /**
+     * Print current failure-detection mode.
      */
     public void statusSus() {
         System.out.println(failureDetectionMode ? "Suspicion mode enabled" : "Suspicion mode disabled");
     }
 
 
-    /*
-     Change suspicion mode.
-     Disseminate "ModeUpdate" Message to inform all nodes of the mode update.
+    /**
+     * Change failure-detection mode.
+     * Disseminate "ModeUpdate" Message to inform all nodes of the mode update.
+     * @param suspicionMode true to enable suspicion mode; false to disable suspicion mode.
      */
     public void switchMode(boolean suspicionMode) {
         this.failureDetectionMode = suspicionMode;
@@ -750,10 +895,11 @@ public class Server {
     }
 
 
-    /*
-    Handle "Ping" messages.
-    Regular mode: record ping receiving time and sender node id.
-    Suspicion mode: respond with "PingAck" message.
+    /**
+     * Handle "Ping" messages.
+     * Regular mode: record ping receiving time and sender node id.
+     * Suspicion mode: respond with "PingAck" message.
+     * @param message Message received at the UDP port.
      */
     private void handlePing(JSONObject message) {
         if (failureDetectionMode){
@@ -776,10 +922,11 @@ public class Server {
     }
 
 
-    /*
-    Handle "PingAck" messages.
-    Remove the sender from lastPingTimes tracking list.
-    Disseminate "Alive" message for the sender if it is being suspected.
+    /**
+     * Handle "PingAck" messages.
+     * Remove the sender from lastPingTimes tracking list.
+     * Disseminate "Alive" message for the sender if it is being suspected.
+     * @param message Message received at the UDP port.
      */
     private void handlePingAck(JSONObject message) {
         int senderNodeId = message.getInt("nodeId");
@@ -800,9 +947,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "Alive" message.
-    Suspicion mode only: check incarnation number and set suspected node to alive.
+    /**
+     * Handle "Alive" message.
+     * Suspicion mode only: check incarnation number and set suspected node to alive.
+     * @param message Message received at the UDP port.
      */
     private void handleAlive(JSONObject message) {
         int aliveNodeId = message.getInt("nodeId");
@@ -818,10 +966,11 @@ public class Server {
     }
 
 
-    /*
-    Handle "Suspect" message.
-    Suspicion mode only: disseminate "Alive" message if this node is suspected;
-    Otherwise, update suspected node status.
+    /**
+     * Handle "Suspect" message.
+     * Suspicion mode only: disseminate "Alive" message if this node is suspected;
+     * Otherwise, update suspected node status.
+     * @param message Message received at the UDP port.
      */
     private void handleSuspect(JSONObject message) {
         int suspectNodeId = message.getInt("nodeId");
@@ -845,10 +994,11 @@ public class Server {
     }
 
 
-    /*
-    Handle "Join" message.
-    Add the new node as member.
-    If this node is introducer, respond to the requester, add gossipCount, and start gossip.
+    /**
+     * Handle "Join" message.
+     * Add the new node as member.
+     * If this node is introducer, respond to the requester, add gossipCount, and start gossip.
+     * @param message Message received at the TCP port.
      */
     private void handleJoin(JSONObject message) {
         int joiningNodeId = message.getInt("nodeId");
@@ -893,9 +1043,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "JoinResponse".
-    Read and add membership within the response.
+    /**
+     * Handle "JoinResponse" message.
+     * Read and add membership within the response.
+     * @param message Message received at the TCP port.
      */
     private void handleJoinResponse(JSONObject message) {
         logger.info("Node " + this.nodeId + " received JoinResponse");
@@ -928,9 +1079,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "Leave" message.
-    Update membership and re-replicate files as needed.
+    /**
+     * Handle "Leave" message.
+     * Update membership and re-replicate files as needed.
+     * @param message Message received at the TCP port.
      */
     private void handleLeave(JSONObject message) {
         int leftNodeId = message.getInt("nodeId");
@@ -943,9 +1095,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "Failure" message.
-    Remove failed node from membership and re-replicate files as needed.
+    /**
+     * Handle "Failure" message.
+     * Remove failed node from membership and re-replicate files as needed.
+     * @param message Message received at the TCP port.
      */
     private void handleFailure(JSONObject message) {
         int failedNodeId = message.getInt("nodeId");
@@ -961,9 +1114,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "CreateFile" request.
-    Create a new file block with given blockNum in HyDFS and save it on this node.
+    /**
+     * Handle "CreateFile" request.
+     * Create a new file block with given blockNum in HyDFS and save it on this node.
+     * @param message Message received at the TCP port.
      */
     private void handleCreateFile(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
@@ -1002,6 +1156,10 @@ public class Server {
     }
 
 
+    /**
+     * Handle "CreateFileResponse" message.
+     * @param message Message received at the TCP port.
+     */
     private void handleCreateFileResponse(JSONObject message) {
         if(message.getBoolean("succeed")) {
             logger.info("Succeed to create hydfsFile " + message.getString("hydfsFilename"));
@@ -1013,8 +1171,9 @@ public class Server {
     }
 
 
-    /*
-     Handle "UpdateFile" message and update fileBlockMap.
+    /**
+     * Handle "UpdateFile" message and update fileBlockMap.
+     * @param message Message received at the TCP port.
      */
     private void handleUpdateFile(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
@@ -1027,9 +1186,10 @@ public class Server {
     }
 
 
-    /*
-    Respond to "GetFile" request.
-    Send "GetFileResponse" message with the requested block to the requester.
+    /**
+     * Respond to "GetFile" request.
+     * Send "GetFileResponse" message with the requested block to the requester.
+     * @param message Message received at the TCP port.
      */
     private void handleGetFile(JSONObject message) {
         Node requester = membership.get(message.getInt("nodeId"));
@@ -1054,9 +1214,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "GetFileResponse" message.
-    Store the received block into cache.
+    /**
+     * Handle "GetFileResponse" message.
+     * Store the received block into cache.
+     * @param message Message received at the TCP port.
      */
     private void handleGetFileResponse(JSONObject message) {
         int blockId = message.getInt("blockId");
@@ -1081,9 +1242,10 @@ public class Server {
     }
 
 
-    /*
-    Respond to "GetFromReplica" request.
-    Send "GetFromReplicaResponse" message with the requested block to the requester.
+    /**
+     * Respond to "GetFromReplica" request.
+     * Send "GetFromReplicaResponse" message with the requested block to the requester.
+     * @param message Message received at the TCP port.
      */
     private void handleGetFromReplica(JSONObject message) {
         Node requester = membership.get(message.getInt("nodeId"));
@@ -1106,9 +1268,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "GetFromReplicaResponse" message.
-    Store the received block to the specified local file path.
+    /**
+     * Handle "GetFromReplicaResponse" message.
+     * Store the received block to the specified local file path.
+     * @param message Message received at the TCP port.
      */
     public void handleGetFromReplicaResponse(JSONObject message) {
         String blockName = message.getString("blockName");
@@ -1124,13 +1287,14 @@ public class Server {
     }
 
 
-    /*
-    Handle "Append" request.
-    This node works as a leader to handle all "Append" requests of the HyDFS file,
-    whose first block is stored at this node.
-    Check and update the request's block ID.
-    Send "CreateFile" message to successors to create the new block.
-    Disseminate "UpdateFile" message to inform all nodes of the new block.
+    /**
+     * Handle "Append" request.
+     * This node works as a leader to handle all "Append" requests of the HyDFS file,
+     * whose first block is stored at this node.
+     * Check and update the request's block ID.
+     * Send "CreateFile" message to successors to create the new block.
+     * Disseminate "UpdateFile" message to inform all nodes of the new block.
+     * @param message Message received at the TCP port.
      */
     private void handleAppendFile(JSONObject message) {
         // Update message block ID if the local block ID is larger
@@ -1158,9 +1322,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "AppendFileFrom" request.
-    Initiate a new append request from this node as requested by the multi-append command.
+    /**
+     * Handle "AppendFileFrom" request.
+     * Initiate a new append request from this node as requested by the multi-append command.
+     * @param message Message received at the TCP port.
      */
     private void handleAppendMultiFiles(JSONObject message) {
         String hydfsFilename = message.getString("hydfsFilename");
@@ -1169,11 +1334,12 @@ public class Server {
     }
 
 
-    /*
-    Handle "MergeFile" request.
-    Disseminate "MergeFileFrom" message to request all blocks of the HyDFS file being merged.
-    Append all blocks to the first block and replicate to successors.
-    Disseminate "MergeFileResponse" message to inform all nodes of the completion of merge.
+    /**
+     * Handle "MergeFile" request.
+     * Disseminate "MergeFileFrom" message to request all blocks of the HyDFS file being merged.
+     * Append all blocks to the first block and replicate to successors.
+     * Disseminate "MergeFileResponse" message to inform all nodes of the completion of merge.
+     * @param message Message received at the TCP port.
      */
     private void handleMergeFile(JSONObject message) {
         System.out.println("Received merge request at time: " + clock.millis());
@@ -1181,11 +1347,13 @@ public class Server {
         int requesterNodeId = message.getInt("requesterNodeId");
         int blockNum = fileBlockMap.get(hydfsFilename);
         String firstBlockName = "1_" + hydfsFilename;
+
         // Add all unreceived blocks to unreceivedBlocks[hydfsFilename]
         unreceivedBlocks.put(hydfsFilename, new HashSet<>());
         for (int i = 1; i <= blockNum; ++i)
             if (!localFiles.contains(i + "_" + hydfsFilename))
                 unreceivedBlocks.get(hydfsFilename).add(i);
+
         // Disseminate "MergeFileFrom" message to request blocks from all nodes
         JSONObject mergeFileMessage = new JSONObject();
         mergeFileMessage.put("type", "MergeFileFrom");
@@ -1193,6 +1361,7 @@ public class Server {
         mergeFileMessage.put("gossipCount", 0);
         gossip(mergeFileMessage, true);
         logger.info("Start disseminating \"MergeFileFrom\" requests");
+
         // Wait until all blocks are received
         while(!unreceivedBlocks.get(hydfsFilename).isEmpty()){
             try {
@@ -1202,6 +1371,7 @@ public class Server {
             }
         }
         logger.info("Received all blocks of HyDFS file " + hydfsFilename);
+
         // Append all blocks to the first block of the HyDFS file
         List<String> blockFiles = new ArrayList<>();
         for(int i = 2; i <= blockNum; ++i)
@@ -1218,6 +1388,7 @@ public class Server {
             logger.warning("Failed to write to block " + firstBlockName);
         }
         logger.info("Finish writing all blocks to the first block " + firstBlockName);
+
         // Replicate the merged HyDFS file to successors
         try {
             JSONObject recreateFileMessage = new JSONObject();
@@ -1232,6 +1403,7 @@ public class Server {
         } catch (IOException e) {
             logger.warning("Failed to send \"RecreateFile\" requests to successors");
         }
+
         // Disseminate MergeFileResponse message
         JSONObject mergeAckMessage = new JSONObject();
         mergeAckMessage.put("type", "MergeFileResponse");
@@ -1243,9 +1415,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "MergeFileFrom" message.
-    Send "MergeFileFromResponse" with this node's blocks of the HyDFS file being merged.
+    /**
+     * Handle "MergeFileFrom" message.
+     * Send "MergeFileFromResponse" with this node's blocks of the HyDFS file being merged.
+     * @param message Message received at the TCP port.
      */
     private void handleMergeFileFrom(JSONObject message) {
         gossip(message, true);
@@ -1278,9 +1451,10 @@ public class Server {
     }
 
 
-    /*
-    Handle "MergeFileResponse" message.
-    Clean up file blocks and update block number for the merged HyDFS file.
+    /**
+     * Handle "MergeFileResponse" message.
+     * Clean up file blocks and update block number for the merged HyDFS file.
+     * @param message Message received at the TCP port.
      */
     private void handleMergeFileResponse(JSONObject message) {
         gossip(message, true);
@@ -1307,11 +1481,12 @@ public class Server {
     }
 
 
-    /*
-    Handle "MergeFileFromResponse" message.
-    Store the received block and mark the block as received to proceed the merge process.
+    /**
+     * Handle "MergeFileFromResponse" message.
+     * Store the received block and mark the block as received to proceed the merge process.
+     * @param message Message received at the TCP port.
      */
-    public void handleMergeFileFromResponse(JSONObject message) {
+    private void handleMergeFileFromResponse(JSONObject message) {
         String blockName = message.getString("blockName");
         int blockId = message.getInt("blockId");
         String hyDFSFileName = message.getString("hydfsFilename");
@@ -1327,11 +1502,12 @@ public class Server {
             }
         }
     }
-    
 
-    /*
-    Handle "ModeUpdate" message.
-    Update failure detection node.
+
+    /**
+     * Handle "ModeUpdate" message.
+     * Update failure detection node.
+     * @param message Message received at the TCP port.
      */
     private void handleModeUpdate(JSONObject message) {
         boolean suspicionMode = message.getString("suspicionMode").equals("enabled");
@@ -1343,10 +1519,11 @@ public class Server {
     }
 
 
-    /*
-    Handle "RecreateFile" message.
-    Re-create a specified file block locally on a node leave/failure.
-    */
+    /**
+     * Handle "RecreateFile" message.
+     * Re-create a specified file block locally on a node leave/failure.
+     * @param message Message received at the TCP port.
+     */
     private void handleRecreateFile(JSONObject message) {
         try {
             String blockName = message.getString("blockName");
@@ -1358,16 +1535,19 @@ public class Server {
             localFiles.add(blockName);
             logger.info("Recreated block " + blockName + " and saved to local storage at " + filePath);
         } catch (IOException e) {
-            logger.warning("Failed to recreate block " + message.getString("blockName") + ": " + e.getMessage());
+            logger.warning("Failed to recreate block " + message.getString("blockName")
+                    + ": " + e.getMessage());
         }
 
     }
 
 
-    /*
-    Re-replicate files when a node leaves or fails, called by HandleLeave, HandleFailure
-    Check if this node stores any replicas previously stored by the dropped node.
-    If it does, send "RecreateFile" request to the new locations to store the replicas.
+    /**
+     * Re-replicate files when a node leaves or fails, called by HandleLeave, HandleFailure
+     * Check if this node stores any replicas previously stored by the dropped node.
+     * If it does, send "RecreateFile" request to the new locations to store the replicas.
+     * @param replNodeId The node whose stored files need to be re-replicated.
+     * @param dropped Whether the node drops after the re-replication
      */
     private void reReplication(int replNodeId, boolean dropped){
         // Loop through local files to create "RecreateFile" message for all files to be re-replicated
@@ -1396,6 +1576,7 @@ public class Server {
             }
         }
         if (dropped) ch.removeServer(replNodeId);
+
         // Send "RecreateFile" messages and file data to the new server to store the file
         for(JSONObject recreateFileMessage : recreateFileMessages){
             Node receiver1 = membership.get(
@@ -1410,8 +1591,10 @@ public class Server {
     }
 
 
-    /*
-    Called by appendMultiFiles function to record operation time length.
+    /**
+     * Called by appendMultiFiles function to record operation time length.
+     * @param hydfsFilename Filename of the destination file on HyDFS.
+     * @param nodeIds String of IDs of nodes to append from, separated by commas.
      */
     private void appendMultiFilesTimeCheck(String hydfsFilename, String nodeIds) {
         String[] nodeIdArray = nodeIds.replaceAll("\\s", "").split(",");
@@ -1431,8 +1614,9 @@ public class Server {
     }
 
 
-    /*
-    Called by mergeFile function to record operation time length.
+    /**
+     * Called by mergeFile function to record operation time length.
+     * @param hydfsFilename Filename of the HyDFS file to be merged.
      */
     private void mergeTimeCheck(String hydfsFilename) {
         long mergeStartTime = clock.millis();
@@ -1450,30 +1634,10 @@ public class Server {
     }
 
 
-    /*
-    Helper function to recursively delete directories.
+    /**
+     * Lock and wait until another command is finished.
+     * @param methodName The name of the method going to run. Mainly for debug purpose.
      */
-    public void deleteDirectoryRecursively(Path path) {
-        try {
-            Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    Files.delete(file);
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                    Files.delete(dir);
-                    return FileVisitResult.CONTINUE;
-                }
-            });
-        } catch (IOException e) {
-            System.out.println("ERROR: Failed to recursively delete existing directory" + path);
-        }
-    }
-
-
     private void lock(String methodName) {
         int counter = 0;
         while (locked) {
@@ -1490,75 +1654,5 @@ public class Server {
         }
         locked = true;
     }
-
-
-    /*
-     Common method used to send a message through TCP to the specified node.
-     */
-    private void sendTCP(String receiverIp, int receiverPort, JSONObject message){
-        try (Socket socket = new Socket(receiverIp, receiverPort)) {
-            socket.setSoTimeout(10000);
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-            writer.write(message.toString());
-            writer.newLine();
-            writer.flush();
-            logger.info("Send " + message.getString("type") + " message to"
-                    + receiverIp + ":" + receiverPort);
-        } catch (IOException e) {
-            logger.warning("Failed to send " + message.getString("type") + " message to "
-                    + receiverIp + ":" + receiverPort + e.getMessage());
-        }
-    }
-
-
-    /*
-     Common method used to send a message through UDP to the specified node.
-     */
-    private void sendUDP(String receiverIp, int receiverPort, JSONObject message) {
-        try (DatagramSocket socket = new DatagramSocket()) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            ObjectOutputStream oos = new ObjectOutputStream(baos);
-            oos.writeObject(message.toString());
-            byte[] buffer = baos.toByteArray();
-            InetAddress address = InetAddress.getByName(receiverIp);
-            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, receiverPort);
-            socket.send(packet);
-        } catch (IOException e) {
-            logger.warning("Failed to send " + message.getString("type") + " message to "
-                    + receiverIp + ":" + receiverPort);
-        }
-    }
-
-
-    /*
-    Common method to initiate gossip dissemination to all nodes potentially alive.
-     */
-    private void gossip(JSONObject message, boolean isTCP) {
-        // Check and add the gossip count
-        int gossipCount = message.getInt("gossipCount");
-        if(gossipCount > 2) return;
-        message.put("gossipCount", gossipCount + 1);
-        // Check current available members
-        List<Node> availableMembers = new ArrayList<>();
-        for (Node member : membership.values()) {
-            if (member.getStatus().equals("alive") ||
-                    failureDetectionMode && member.getStatus().equals("suspect")) {
-                availableMembers.add(member);
-            }
-        }
-        int availableNumber = Math.min(availableMembers.size(), (availableMembers.size() / 3 + 2));
-        if (availableNumber < 1) {
-            logger.warning("No other member to disseminate message");
-            return;
-        }
-        // Send gossip message to random available numbers
-        Collections.shuffle(availableMembers, new Random());
-        List<Node> selectedMembers = availableMembers.subList(0, availableNumber);
-        for(Node member: selectedMembers) {
-            if (isTCP) sendTCP(member.getIpAddress(), member.getPortTCP(), message);
-            else sendUDP(member.getIpAddress(), member.getPortUDP(), message);
-        }
-    }
-
 
 }

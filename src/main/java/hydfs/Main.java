@@ -4,23 +4,30 @@ import java.util.Scanner;
 import java.util.concurrent.*;
 
 
-/*
-HyDFS client-side UI.
-Initialize a new node for HyDFS with TCP/UDP monitor and failure detection.
-Read in command line inputs and send requests to servers within HyDFS.
+/**
+ * HyDFS client-side UI.
+ * Initialize a new node for HyDFS with TCP/UDP monitor and failure detection.
+ * Read in command line inputs and send requests to servers within HyDFS.
  */
 public class Main {
     public static void main(String[] args) {
+        if(args.length != 5) {
+            System.out.println("Usage: Main <Node ID> <IP Address> <TCP Port> <UDP Port> <Cache Size>");
+            return;
+        }
+
         // Start threads to listen to TCP/UDP messages
         Server server = new Server(args);
         Thread tcpListen = new Thread(server::tcpListen);
         tcpListen.start();
         Thread udpListen = new Thread(server::udpListen);
         udpListen.start();
+
         // Start threads to periodically ping and check for failure detection
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
         scheduler.scheduleAtFixedRate(server::ping, 0, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(server::checkPing, 1, 1, TimeUnit.SECONDS);
+
         // Read command line input and call corresponding client-side function.
         Scanner scanner = new Scanner(System.in);
         boolean running = true;

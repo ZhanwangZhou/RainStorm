@@ -2,8 +2,8 @@ package main.java.hydfs;
 import java.util.HashMap;
 
 
-/*
-LRU Cache used to store recently read HyDFS files.
+/**
+ * LRU Cache used to store recently read HyDFS files.
  */
 class LRUCache {
     HashMap<String, Node> map = new HashMap<>();

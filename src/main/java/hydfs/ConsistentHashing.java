@@ -7,10 +7,10 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 
-/*
-Ring data structure holding all nodes in HyDFS.
-Use consistent hashing to determine the ring ID of each node and
-the node where each file is stored.
+/**
+ * Ring data structure holding all nodes in HyDFS.
+ * Use consistent hashing to determine the ring ID of each node and
+ * the node where each file is stored.
  */
 public class ConsistentHashing {
     private TreeMap<Long, Integer> ring;

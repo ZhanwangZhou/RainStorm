@@ -3,8 +3,8 @@ package main.java.hydfs;
 import java.io.Serializable;
 
 
-/*
-Store basic info for a single device in HyDFS.
+/**
+ * Store basic info for a single device in HyDFS.
  */
 public class Node implements Serializable {
     private int nodeId;
